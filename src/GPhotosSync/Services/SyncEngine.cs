@@ -231,6 +231,7 @@ public class SyncEngine : IDisposable
 
     public void UpdateConfiguration()
     {
+        Logger.VerboseEnabled = _config.VerboseLogging;
         EnsureEvidenceBoundToAccount();
         RefreshBulkDeleteStateFromDatabase();
         RefreshAccountDeleteVerificationState();
@@ -416,8 +417,8 @@ public class SyncEngine : IDisposable
         var batchId = _blockedBulkDeleteBatchId;
         int count = _db.CancelBulkDeleteBatch(batchId);
         RefreshBulkDeleteStateFromDatabase();
-        Logger.Info($"Uživatel zrušil hromadné mazání dávky '{batchId}' ({count} lokálně odebraných položek bylo odpojeno od mazání v Google Photos).");
-        RaiseStatus("Hromadné mazání zrušeno – fotky v Google Photos ponechány", isSyncing: false);
+        Logger.Info($"Uživatel zrušil hromadné mazání dávky '{batchId}': {count} fotek zůstává v Google Photos a stáhne se zpět do složky.");
+        RaiseStatus("Hromadné mazání zrušeno – fotky se stáhnou zpět do složky", isSyncing: false);
     }
 
     public Task ProcessLocalDeletionsAsync(CancellationToken ct = default)
@@ -923,6 +924,16 @@ public class SyncEngine : IDisposable
         return wasRemoteDeleted && (now - record.UpdatedAt) > TimeSpan.FromMinutes(5);
     }
 
+    private static bool IsVideoFileName(string? fileName)
+    {
+        var ext = Path.GetExtension(fileName ?? string.Empty);
+        return ext.Equals(".mp4", StringComparison.OrdinalIgnoreCase) || ext.Equals(".mov", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".m4v", StringComparison.OrdinalIgnoreCase) || ext.Equals(".avi", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".mkv", StringComparison.OrdinalIgnoreCase) || ext.Equals(".3gp", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".webm", StringComparison.OrdinalIgnoreCase) || ext.Equals(".mts", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".m2ts", StringComparison.OrdinalIgnoreCase);
+    }
+
     private const int MaxHashBackfillPerCycle = 100;
     private static readonly TimeSpan MaxHashBackfillDuration = TimeSpan.FromSeconds(2);
 
@@ -1244,7 +1255,7 @@ public class SyncEngine : IDisposable
             }
 
             var discovered = discoveredByKey.Values.ToList();
-            Logger.Info($"Nalezeno {discovered.Count} položek ke kontrole z Google Photos.");
+            Logger.Debug($"Nalezeno {discovered.Count} položek ke kontrole z Google Photos.");
 
             var newItems = new List<DiscoveredMediaItem>();
             foreach (var item in discovered)
@@ -1293,6 +1304,25 @@ public class SyncEngine : IDisposable
                 newItems.Add(item);
             }
 
+            // Fotky, jejichž hromadné mazání uživatel zrušil, se stáhnou zpět do složky (nezávisle na časové ose)
+            var restoreRequested = _db.GetItemsByStatus(SyncItemStatus.SkippedInitial)
+                .Where(r => r.SkipReason == SkipReason.RestoreRequested)
+                .ToList();
+            if (restoreRequested.Count > 0)
+            {
+                Logger.Info($"Stahuji zpět {restoreRequested.Count} fotek, jejichž hromadné smazání bylo zrušeno.");
+                newItems.InsertRange(0, restoreRequested
+                    .Where(r => newItems.All(n => n.MediaKey != r.MediaKey))
+                    .Select(r => new DiscoveredMediaItem
+                    {
+                        MediaKey = r.MediaKey,
+                        PhotoUrl = string.IsNullOrWhiteSpace(r.PhotoUrl) ? $"https://photos.google.com/photo/{r.MediaKey}" : r.PhotoUrl,
+                        IsVideo = IsVideoFileName(r.LocalFileName),
+                        EstimatedDate = r.TakenAt,
+                        ForceDownload = true
+                    }));
+            }
+
             // Bod 10c: Omezit počet stahování v jednom cyklu na dávku, aby cyklus neblokoval mazání ani odezvu aplikace
             bool downloadBatchTruncated = newItems.Count > MaxDownloadsPerCycle;
             var itemsToDownloadThisCycle = downloadBatchTruncated
@@ -1305,7 +1335,7 @@ public class SyncEngine : IDisposable
 
             if (itemsToDownloadThisCycle.Count == 0)
             {
-                Logger.Info("Žádné nové položky ke stažení v tomto cyklu.");
+                Logger.Debug("Žádné nové položky ke stažení v tomto cyklu.");
             }
             else
             {
@@ -1329,7 +1359,7 @@ public class SyncEngine : IDisposable
                         ? (baselineIncomplete ? _config.InstalledAt.Date : null)
                         : _config.GetCutoffDate();
 
-                    if (cutoffDate.HasValue && item.EstimatedDate.HasValue && item.EstimatedDate.Value.Date < cutoffDate.Value.Date)
+                    if (!item.ForceDownload && cutoffDate.HasValue && item.EstimatedDate.HasValue && item.EstimatedDate.Value.Date < cutoffDate.Value.Date)
                     {
                         Logger.Info($"Přeskakuji starší položku '{item.MediaKey}' podle nově upraveného nastavení ({item.EstimatedDate.Value:dd.MM.yyyy} < {cutoffDate.Value:dd.MM.yyyy}).");
                         _db.UpsertItem(new SyncItemRecord
@@ -1342,7 +1372,7 @@ public class SyncEngine : IDisposable
                             Status = SyncItemStatus.SkippedInitial,
                             SkipReason = SkipReason.CutoffDate
                         });
-                        lastProcessedMediaKey = item.MediaKey;
+                        if (!item.ForceDownload) lastProcessedMediaKey = item.MediaKey;
                         continue;
                     }
 
@@ -1378,7 +1408,7 @@ public class SyncEngine : IDisposable
                             Status = SyncItemStatus.SkippedInitial,
                             SkipReason = SkipReason.VideoDisabled
                         });
-                        lastProcessedMediaKey = item.MediaKey;
+                        if (!item.ForceDownload) lastProcessedMediaKey = item.MediaKey;
                         continue;
                     }
 
@@ -1388,7 +1418,8 @@ public class SyncEngine : IDisposable
                                                        cutoffDate.HasValue &&
                                                        item.EstimatedDate.Value.Date >= cutoffDate.Value.Date;
 
-                        if (!timelineConfirmedRecent &&
+                        if (!item.ForceDownload &&
+                            !timelineConfirmedRecent &&
                             cutoffDate.HasValue &&
                             res.TakenAt.HasValue &&
                             res.TakenAt.Value.Date < cutoffDate.Value.Date)
@@ -1405,7 +1436,7 @@ public class SyncEngine : IDisposable
                                 Status = SyncItemStatus.SkippedInitial,
                                 SkipReason = SkipReason.CutoffDate
                             });
-                            lastProcessedMediaKey = item.MediaKey;
+                            if (!item.ForceDownload) lastProcessedMediaKey = item.MediaKey;
                             continue;
                         }
 
@@ -1423,7 +1454,7 @@ public class SyncEngine : IDisposable
                         });
 
                         downloadedCount++;
-                        lastProcessedMediaKey = item.MediaKey;
+                        if (!item.ForceDownload) lastProcessedMediaKey = item.MediaKey;
                         Logger.Info($"Staženo: {res.LocalFileName} ({res.FileSize / 1024:N0} KB)");
                     }
                     else

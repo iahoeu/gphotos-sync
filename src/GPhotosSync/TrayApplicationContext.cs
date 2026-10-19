@@ -32,6 +32,7 @@ public class TrayApplicationContext : ApplicationContext
     public TrayApplicationContext()
     {
         _config = AppConfig.Load();
+        Logger.VerboseEnabled = _config.VerboseLogging;
         _db = new SyncDatabase();
         _photosEngine = new GooglePhotosEngine();
         _syncEngine = new SyncEngine(_config, _db, _photosEngine);
@@ -71,7 +72,7 @@ public class TrayApplicationContext : ApplicationContext
             ForeColor = Color.FromArgb(190, 40, 40)
         };
 
-        _cancelBulkDeleteMenuItem = new ToolStripMenuItem("🛡️ Zrušit hromadné mazání (odpojit zablokovanou dávku)", null, (_, _) =>
+        _cancelBulkDeleteMenuItem = new ToolStripMenuItem("🛡️ Zrušit hromadné mazání (nechat v Google Photos a stáhnout zpět)", null, (_, _) =>
         {
             _syncEngine.CancelPendingBulkDelete();
         })

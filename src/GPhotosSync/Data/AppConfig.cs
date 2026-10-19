@@ -36,6 +36,11 @@ public class AppConfig
     public string ExpectedGoogleAccountEmail { get; set; } = "";
     public int MaxAutoDeletesPerCycle { get; set; } = 50;
 
+    /// <summary>
+    /// Podrobný protokol (kroky skenování a navigace) – jen pro ladění.
+    /// </summary>
+    public bool VerboseLogging { get; set; } = false;
+
     // Gitea Auto-Update Configuration
     public bool AutoCheckUpdates { get; set; } = true;
     public bool AutoInstallUpdates { get; set; } = false;

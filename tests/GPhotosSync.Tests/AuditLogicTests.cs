@@ -553,6 +553,7 @@ public class AuditLogicTests : IDisposable
         Assert.Equal(SyncItemStatus.Downloaded, dbAfterRestart.GetByMediaKey("keep_downloaded_1")!.Status);
         Assert.Equal(SyncItemStatus.PendingRemoteDelete, dbAfterRestart.GetByMediaKey("extra_new_delete")!.Status);
         Assert.Equal(SyncItemStatus.SkippedInitial, dbAfterRestart.GetByMediaKey("batch_item_3")!.Status);
+        Assert.Equal(SkipReason.RestoreRequested, dbAfterRestart.GetByMediaKey("batch_item_3")!.SkipReason); // stáhne se zpět
     }
 
     // -------------------------------------------------------------------------

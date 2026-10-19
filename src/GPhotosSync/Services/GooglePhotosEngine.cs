@@ -16,6 +16,11 @@ public class DiscoveredMediaItem
     public bool IsVideo { get; set; }
     public DateTime? EstimatedDate { get; set; }
     public bool DiscoveredFromRecentlyAdded { get; set; }
+
+    /// <summary>
+    /// Stáhnout bez ohledu na časový limit (např. fotky vrácené po zrušení hromadného mazání).
+    /// </summary>
+    public bool ForceDownload { get; set; }
 }
 
 /// <summary>
@@ -597,7 +602,7 @@ public class GooglePhotosEngine : IDisposable
         {
             await EnsureInitializedAsync();
             const string recentlyAddedUrl = "https://photos.google.com/search/_tra_";
-            Logger.Info($"Kontroluji pohled 'Nedávno přidané' ({recentlyAddedUrl})...");
+            Logger.Debug($"Kontroluji pohled 'Nedávno přidané' ({recentlyAddedUrl})...");
 
             bool navOk = await NavigateAndWaitForDomAsync(recentlyAddedUrl, 15000);
             if (!navOk)
@@ -750,7 +755,7 @@ public class GooglePhotosEngine : IDisposable
             await EnsureInitializedAsync();
             var itemsById = new Dictionary<string, DiscoveredMediaItem>(StringComparer.Ordinal);
 
-            Logger.Info("Otevírám časovou osu Google Photos (https://photos.google.com/)...");
+            Logger.Debug("Otevírám časovou osu Google Photos (https://photos.google.com/)...");
             bool navOk = await NavigateAndWaitForDomAsync("https://photos.google.com/", 18000);
             if (!navOk)
             {
@@ -779,7 +784,7 @@ public class GooglePhotosEngine : IDisposable
 
             int domAnchorCount = await WaitForPhotoAnchorsAsync(maxWaitSteps: 15, ct);
             currentUrl = _webView.CoreWebView2.Source ?? "";
-            Logger.Info($"Stránka Google Photos načtena ({currentUrl}), počáteční počet DOM odkazů: {domAnchorCount}.");
+            Logger.Debug($"Stránka Google Photos načtena ({currentUrl}), počáteční počet DOM odkazů: {domAnchorCount}.");
 
             if (domAnchorCount == 0)
             {
@@ -875,7 +880,7 @@ public class GooglePhotosEngine : IDisposable
                 }
 
                 var decision = progress.RecordStep(newlyAddedInStep, newUnseenCandidateCountInStep);
-                Logger.Info($"Skenování časové osy (krok {progress.TotalSteps}{(progress.PassedResumeKey ? "" : ", posun k místu minulého skenu")}): doposud nalezeno {itemsById.Count} položek (+{newlyAddedInStep} v tomto kroku).");
+                Logger.Debug($"Skenování časové osy (krok {progress.TotalSteps}{(progress.PassedResumeKey ? "" : ", posun k místu minulého skenu")}): doposud nalezeno {itemsById.Count} položek (+{newlyAddedInStep} v tomto kroku).");
 
                 // P1-9: v běžném režimu (po překonání případného resume bodu) souvislá vrstva již známých/starších položek
                 if (decision == TimelineScanDecision.KnownBoundaryReached)
@@ -1324,7 +1329,7 @@ public class GooglePhotosEngine : IDisposable
             _webView.CoreWebView2.DownloadStarting += OnDownloadStarting;
             try
             {
-                Logger.Info($"Otevírám detail položky pro stažení: {item.PhotoUrl}");
+                Logger.Debug($"Otevírám detail položky pro stažení: {item.PhotoUrl}");
                 bool navOk = await NavigateAndWaitForDomAsync(item.PhotoUrl, 15000);
                 if (!navOk)
                 {
@@ -1508,7 +1513,7 @@ public class GooglePhotosEngine : IDisposable
             await EnsureInitializedAsync();
             var targetUrl = $"https://photos.google.com/photo/{mediaKey}";
 
-            Logger.Info($"Obousměrná synchronizace: Otevírám položku '{mediaKey}' pro přesun do koše...");
+            Logger.Debug($"Obousměrná synchronizace: Otevírám položku '{mediaKey}' pro přesun do koše...");
 
             bool navOk = await NavigateAndWaitForDomAsync(targetUrl, 15000);
             if (!navOk)

@@ -219,7 +219,8 @@ public static class Program
             "sync_history.db-wal",
             "sync_history.db-shm",
             "sync_history.db-journal",
-            "sync.log"
+            "sync.log",
+            "sync.old.log"
         ];
 
         foreach (var f in knownAppDataFiles)

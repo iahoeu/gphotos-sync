@@ -18,7 +18,8 @@ public enum SkipReason
     CutoffDate = 2,
     VideoDisabled = 3,
     FolderUnlinked = 4,
-    DeleteUnconfirmed = 5
+    DeleteUnconfirmed = 5,
+    RestoreRequested = 6
 }
 
 public class SyncItemRecord
@@ -561,8 +562,9 @@ public class SyncDatabase
     }
 
     /// <summary>
-    /// Bod 7 + Doplněk: Zruší hromadné mazání a odpojí VÝHRADNĚ položky z dané zablokované dávky (Status = 2 a shodné BatchId),
-    /// nikdy neodpojuje ostatní stažené soubory (Status = 0)!
+    /// Bod 7 + Doplněk: Zruší hromadné mazání VÝHRADNĚ pro položky dané zablokované dávky (Status = 2 a shodné BatchId):
+    /// v Google Photos se nemažou a označí se ke stažení zpět do složky (RestoreRequested).
+    /// Ostatní stažené soubory (Status = 0) nejsou dotčeny.
     /// </summary>
     public int CancelBulkDeleteBatch(string batchId)
     {
@@ -583,7 +585,7 @@ public class SyncDatabase
                 WHERE Status = 2 AND BulkDeleteBatchId = $batchId
             ";
             cmd.Parameters.AddWithValue("$skippedStatus", (int)SyncItemStatus.SkippedInitial);
-            cmd.Parameters.AddWithValue("$unlinkedReason", (int)SkipReason.FolderUnlinked);
+            cmd.Parameters.AddWithValue("$unlinkedReason", (int)SkipReason.RestoreRequested);
             cmd.Parameters.AddWithValue("$batchId", batchId);
             cmd.Parameters.AddWithValue("$updated", DateTime.Now.ToString("O"));
             return cmd.ExecuteNonQuery();

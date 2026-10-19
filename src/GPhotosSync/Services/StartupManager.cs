@@ -20,7 +20,11 @@ public static class StartupManager
                 var exePath = Environment.ProcessPath;
                 if (!string.IsNullOrEmpty(exePath))
                 {
-                    key.SetValue(AppValueName, $"\"{exePath}\" --background");
+                    var value = $"\"{exePath}\" --background";
+                    if (string.Equals(key.GetValue(AppValueName) as string, value, StringComparison.OrdinalIgnoreCase))
+                        return; // beze změny – nezapisovat ani nelogovat při každém startu
+
+                    key.SetValue(AppValueName, value);
                     Logger.Info("Automatické spouštění po startu Windows bylo zapnuto.");
                 }
             }
