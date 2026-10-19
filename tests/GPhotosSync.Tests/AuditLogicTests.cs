@@ -554,4 +554,428 @@ public class AuditLogicTests : IDisposable
         Assert.Equal(SyncItemStatus.PendingRemoteDelete, dbAfterRestart.GetByMediaKey("extra_new_delete")!.Status);
         Assert.Equal(SyncItemStatus.SkippedInitial, dbAfterRestart.GetByMediaKey("batch_item_3")!.Status);
     }
+
+    // -------------------------------------------------------------------------
+    // 3. KOLO AUDITU: identita souboru jen přes hash, chyba čtení = nemazat, identita složky v DB
+    // -------------------------------------------------------------------------
+
+    private (AppConfig Cfg, SyncDatabase Db, string PhotosDir) CreateTwoWaySetup(string name)
+    {
+        var photosDir = Path.Combine(_tempRoot, name);
+        Directory.CreateDirectory(photosDir);
+        var cfg = new AppConfig { DownloadFolder = photosDir, TwoWayDelete = true, MaxAutoDeletesPerCycle = 50 };
+        cfg.InitializeFolderMarker(photosDir);
+        var db = new SyncDatabase(Path.Combine(_tempRoot, name + ".db"));
+        return (cfg, db, photosDir);
+    }
+
+    private static SyncItemRecord Record(string key, string fileName, long size, string hash = "") => new()
+    {
+        MediaKey = key,
+        PhotoUrl = $"https://photos.google.com/photo/{key}",
+        LocalFileName = fileName,
+        FileSize = size,
+        FileHash = hash,
+        Status = SyncItemStatus.Downloaded,
+        UpdatedAt = DateTime.Now.AddMinutes(-10)
+    };
+
+    [Fact]
+    public void DetectMissing_WithoutHash_SameNameAndSizeIsNotIdentity_NothingQueuedForDelete()
+    {
+        // A smazána, B přejmenována na sub.jpg (stejná velikost). Bez hashe nesmí B skončit v koši.
+        var (cfg, db, dir) = CreateTwoWaySetup("NoHashSwap");
+        Directory.CreateDirectory(Path.Combine(dir, "sub"));
+        File.WriteAllBytes(Path.Combine(dir, "sub", "a.jpg"), new byte[] { 2, 2, 2, 2 }); // obsah B
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 4));
+        db.UpsertItem(Record("AF1QipKeyB_000000000", "b.jpg", 4));
+
+        var res = SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.True(res.SearchCompleted);
+        Assert.Empty(db.GetItemsByStatus(SyncItemStatus.PendingRemoteDelete));
+        Assert.Equal("b.jpg", db.GetByMediaKey("AF1QipKeyB_000000000")!.LocalFileName);
+        Assert.Equal("a.jpg", db.GetByMediaKey("AF1QipKeyA_000000000")!.LocalFileName);
+    }
+
+    [Fact]
+    public void DetectMissing_WithHashes_RenamedFileClaimedByHashOwner_DeletedFileQueued()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("HashSwap");
+        Directory.CreateDirectory(Path.Combine(dir, "sub"));
+        var renamed = Path.Combine(dir, "sub", "a.jpg");
+        File.WriteAllBytes(renamed, new byte[] { 2, 2, 2, 2 }); // obsah B
+        var hashB = ExifService.ComputeFastFileHash(renamed);
+        var hashA = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(new byte[] { 1, 1, 1, 1 }));
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 4, hashA));
+        db.UpsertItem(Record("AF1QipKeyB_000000000", "b.jpg", 4, hashB));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        var b = db.GetByMediaKey("AF1QipKeyB_000000000")!;
+        Assert.Equal(SyncItemStatus.Downloaded, b.Status);
+        Assert.Equal(Path.Combine("sub", "a.jpg"), b.LocalFileName);
+        Assert.Equal(SyncItemStatus.PendingRemoteDelete, db.GetByMediaKey("AF1QipKeyA_000000000")!.Status);
+    }
+
+    [Fact]
+    public void DetectMissing_CandidateFileLocked_IdentityUnverifiable_NotQueuedForDelete()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("LockedCandidate");
+        var renamed = Path.Combine(dir, "prejmenovana.jpg");
+        File.WriteAllBytes(renamed, new byte[] { 5, 6, 7, 8 });
+        var hash = ExifService.ComputeFastFileHash(renamed);
+        db.UpsertItem(Record("AF1QipLocked_0000000", "puvodni.jpg", 4, hash));
+
+        using (new FileStream(renamed, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            var res = SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+            Assert.Equal(1, res.AmbiguousSkippedCount);
+        }
+
+        Assert.Equal(SyncItemStatus.Downloaded, db.GetByMediaKey("AF1QipLocked_0000000")!.Status);
+    }
+
+    [Fact]
+    public void DetectMissing_BackfillsHashForExistingLegacyFiles()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("Backfill");
+        var path = Path.Combine(dir, "stara.jpg");
+        File.WriteAllBytes(path, new byte[] { 9, 9, 9 });
+        db.UpsertItem(Record("AF1QipLegacy_0000000", "stara.jpg", 3));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Equal(ExifService.ComputeFastFileHash(path), db.GetByMediaKey("AF1QipLegacy_0000000")!.FileHash);
+    }
+
+    [Fact]
+    public void VerifyFolderSafety_FolderIdStoredInDbMismatch_BlocksSync()
+    {
+        // Např. obnova configu ze zálohy ukazující na dřívější složku s vlastním platným markerem
+        var (cfg, db, dir) = CreateTwoWaySetup("DbFolderId");
+        File.WriteAllBytes(Path.Combine(dir, "x.jpg"), new byte[] { 1 });
+        db.UpsertItem(Record("AF1QipFolderId_00000", "x.jpg", 1));
+
+        Assert.True(SyncEngine.VerifyFolderAndConfigSafety(cfg, db, out _));
+        Assert.Equal(cfg.FolderId, db.GetState(SyncEngine.StateKeyFolderId));
+
+        var oldDir = Path.Combine(_tempRoot, "DbFolderIdOld");
+        Directory.CreateDirectory(oldDir);
+        var oldCfg = new AppConfig { DownloadFolder = oldDir, TwoWayDelete = true };
+        oldCfg.InitializeFolderMarker(oldDir, generateNewId: true);
+
+        Assert.False(SyncEngine.VerifyFolderAndConfigSafety(oldCfg, db, out var err));
+        Assert.Contains("evidence", err);
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. KOLO AUDITU
+    // -------------------------------------------------------------------------
+
+    private static string Sha(byte[] data) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data));
+
+    [Fact]
+    public void DetectMissing_FileMovedOntoOriginalPathOfDeletedPhoto_IsRecognizedAndNotTrashed()
+    {
+        // A smazána, B přesunuta přímo na a.jpg (stejná velikost). B nesmí do koše, A ano.
+        var (cfg, db, dir) = CreateTwoWaySetup("MoveOntoPath");
+        var bytesA = new byte[] { 1, 1, 1, 1 };
+        var bytesB = new byte[] { 2, 2, 2, 2 };
+        File.WriteAllBytes(Path.Combine(dir, "a.jpg"), bytesB);
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 4, Sha(bytesA)));
+        db.UpsertItem(Record("AF1QipKeyB_000000000", "b.jpg", 4, Sha(bytesB)));
+
+        var res = SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.True(res.SearchCompleted);
+        var b = db.GetByMediaKey("AF1QipKeyB_000000000")!;
+        Assert.Equal(SyncItemStatus.Downloaded, b.Status);
+        Assert.Equal("a.jpg", b.LocalFileName);
+        Assert.Equal(SyncItemStatus.PendingRemoteDelete, db.GetByMediaKey("AF1QipKeyA_000000000")!.Status);
+    }
+
+    [Fact]
+    public void DetectMissing_FileOnPathWithoutHashAndSameSizeAsMissing_NothingQueued()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("MoveOntoPathNoHash");
+        File.WriteAllBytes(Path.Combine(dir, "a.jpg"), new byte[] { 2, 2, 2, 2 });
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 4));
+        db.UpsertItem(Record("AF1QipKeyB_000000000", "b.jpg", 4, Sha(new byte[] { 2, 2, 2, 2 })));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Empty(db.GetItemsByStatus(SyncItemStatus.PendingRemoteDelete));
+    }
+
+    [Fact]
+    public void DetectMissing_EditedInPlace_StaysDownloaded()
+    {
+        // Úprava na místě (jiná velikost i hash) není smazání
+        var (cfg, db, dir) = CreateTwoWaySetup("EditedInPlace");
+        File.WriteAllBytes(Path.Combine(dir, "a.jpg"), new byte[] { 7, 7, 7, 7, 7, 7 });
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 4, Sha(new byte[] { 1, 1, 1, 1 })));
+        db.UpsertItem(Record("AF1QipKeyC_000000000", "c.jpg", 9, Sha(new byte[9])));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Equal(SyncItemStatus.Downloaded, db.GetByMediaKey("AF1QipKeyA_000000000")!.Status);
+        Assert.Equal(SyncItemStatus.PendingRemoteDelete, db.GetByMediaKey("AF1QipKeyC_000000000")!.Status);
+    }
+
+    [Fact]
+    public void DetectMissing_RenamedAndEdited_IsTreatedAsDeleted_DocumentedBehaviour()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("RenamedEdited");
+        File.WriteAllBytes(Path.Combine(dir, "upravena.jpg"), new byte[] { 3, 3, 3, 3, 3 });
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 4, Sha(new byte[] { 1, 1, 1, 1 })));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Equal(SyncItemStatus.PendingRemoteDelete, db.GetByMediaKey("AF1QipKeyA_000000000")!.Status);
+    }
+
+    [Fact]
+    public void DetectMissing_DuplicateHashCopies_PrefersSameName()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("DuplicateHash");
+        var bytes = new byte[] { 4, 4, 4 };
+        Directory.CreateDirectory(Path.Combine(dir, "x"));
+        Directory.CreateDirectory(Path.Combine(dir, "y"));
+        File.WriteAllBytes(Path.Combine(dir, "x", "kopie.jpg"), bytes);
+        File.WriteAllBytes(Path.Combine(dir, "y", "a.jpg"), bytes);
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 3, Sha(bytes)));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Equal(Path.Combine("y", "a.jpg"), db.GetByMediaKey("AF1QipKeyA_000000000")!.LocalFileName);
+    }
+
+    [Fact]
+    public void DetectMissing_HashedRecordsClaimFilesBeforeHashlessRecordsAreEvaluated()
+    {
+        // Záznam bez hashe by jinak kvůli souboru shodné velikosti zůstal "nejednoznačný",
+        // ale soubor prokazatelně patří záznamu s hashem -> záznam bez hashe je opravdu smazaný.
+        var (cfg, db, dir) = CreateTwoWaySetup("HashedFirst");
+        var bytesB = new byte[] { 6, 6, 6, 6 };
+        File.WriteAllBytes(Path.Combine(dir, "prejmenovana_b.jpg"), bytesB);
+        db.UpsertItem(Record("AF1QipNoHashA_000000", "a.jpg", 4));
+        db.UpsertItem(Record("AF1QipHashedB_000000", "b.jpg", 4, Sha(bytesB)));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Equal("prejmenovana_b.jpg", db.GetByMediaKey("AF1QipHashedB_000000")!.LocalFileName);
+        Assert.Equal(SyncItemStatus.PendingRemoteDelete, db.GetByMediaKey("AF1QipNoHashA_000000")!.Status);
+    }
+
+    [Fact]
+    public void DetectMissing_FolderIdentityFails_SearchNotCompleted_PendingItemsUntouched()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("SearchAbort");
+        db.UpsertItem(Record("AF1QipPending_000000", "gone.jpg", 4, Sha(new byte[] { 1, 2, 3, 4 })));
+        db.UpdateStatus("AF1QipPending_000000", SyncItemStatus.PendingRemoteDelete);
+        File.Delete(Path.Combine(dir, AppConfig.FolderMarkerFileName)); // složka mohla být nahrazena
+
+        var res = SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.False(res.SearchCompleted);
+    }
+
+    [Theory]
+    [InlineData("2026-10-18", "2026-10-19", true)]   // starší než den instalace
+    [InlineData("2026-10-19", "2026-10-19", false)]  // den instalace -> stáhnout
+    [InlineData("2026-10-20", "2026-10-19", false)]  // novější -> stáhnout
+    [InlineData(null, "2026-10-19", true)]           // bez data -> do výchozího stavu
+    public void BelongsToBaseline_ExcludesInstallDayAndNewer(string? taken, string installed, bool expected)
+    {
+        DateTime? t = taken == null ? null : DateTime.Parse(taken);
+        Assert.Equal(expected, SyncEngine.BelongsToBaseline(t, DateTime.Parse(installed).AddHours(14)));
+    }
+
+    [Fact]
+    public void TimelineScanProgress_ResumeSeekStepsDoNotConsumeScanLimit()
+    {
+        var p = new TimelineScanProgress(maxScanSteps: 3, scanAllHistory: true, hasResumeKey: true, maxResumeSeekSteps: 10);
+        for (int i = 0; i < 5; i++)
+        {
+            Assert.True(p.CanContinue);
+            p.RecordStep(newlyAddedItems: 20, newUnseenCandidates: 0); // posun k místu minulého skenu
+        }
+        Assert.Equal(0, p.ScanSteps);
+        p.MarkResumeKeyReached();
+        p.RecordStep(20, 5);
+        p.RecordStep(20, 5);
+        Assert.True(p.CanContinue);
+        p.RecordStep(20, 5);
+        Assert.False(p.CanContinue);
+        Assert.Equal(3, p.ScanSteps);
+    }
+
+    [Fact]
+    public void TimelineScanProgress_SeekCapStopsWhenResumeKeyNeverFound()
+    {
+        var p = new TimelineScanProgress(maxScanSteps: 3, scanAllHistory: true, hasResumeKey: true, maxResumeSeekSteps: 4);
+        int steps = 0;
+        while (p.CanContinue) { p.RecordStep(20, 0); steps++; }
+        Assert.Equal(7, steps);
+        Assert.False(p.PassedResumeKey);
+    }
+
+    [Fact]
+    public void TimelineScanProgress_KnownLayerStopsOnlyAfterPassingResumeKey()
+    {
+        var p = new TimelineScanProgress(maxScanSteps: 50, scanAllHistory: false, hasResumeKey: true);
+        for (int i = 0; i < 5; i++)
+            Assert.Equal(TimelineScanDecision.Continue, p.RecordStep(20, 0));
+
+        p.MarkResumeKeyReached();
+        Assert.Equal(TimelineScanDecision.Continue, p.RecordStep(20, 0));
+        Assert.Equal(TimelineScanDecision.Continue, p.RecordStep(20, 0));
+        Assert.Equal(TimelineScanDecision.KnownBoundaryReached, p.RecordStep(20, 0));
+    }
+
+    [Fact]
+    public void TimelineScanProgress_NoNewItemsSignalsPossibleEndThenGiveUp()
+    {
+        var p = new TimelineScanProgress(maxScanSteps: 50, scanAllHistory: true, hasResumeKey: false);
+        for (int i = 0; i < 10; i++) p.RecordStep(20, 20);
+        TimelineScanDecision d = TimelineScanDecision.Continue;
+        for (int i = 0; i < 4; i++) d = p.RecordStep(0, 0);
+        Assert.Equal(TimelineScanDecision.PossibleEnd, d);
+        Assert.False(p.ShouldGiveUpWithoutConfirmedEnd);
+        for (int i = 0; i < 4; i++) p.RecordStep(0, 0);
+        Assert.True(p.ShouldGiveUpWithoutConfirmedEnd);
+    }
+
+    [Fact]
+    public void AppConfig_OverlapsAppDataFolder_BlocksInsideAndParent()
+    {
+        Assert.True(AppConfig.OverlapsAppDataFolder(Path.Combine(AppConfig.AppDataFolder, "WebViewProfile", "Photos")));
+        Assert.True(AppConfig.OverlapsAppDataFolder(Path.GetDirectoryName(AppConfig.AppDataFolder)!));
+        Assert.False(AppConfig.OverlapsAppDataFolder(Path.Combine(_tempRoot, "Fotky")));
+    }
+
+    [Fact]
+    public void DetectMissing_DisplacedOwnerIsQueuedWithoutPath_SoOtherFileCannotBlockIt()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("DisplacedOwner");
+        var bytesA = new byte[] { 1, 1, 1, 1 };
+        var bytesB = new byte[] { 2, 2, 2, 2 };
+        File.WriteAllBytes(Path.Combine(dir, "a.jpg"), bytesB); // A smazána, B přesunuta na a.jpg
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 4, Sha(bytesA)));
+        db.UpsertItem(Record("AF1QipKeyB_000000000", "b.jpg", 4, Sha(bytesB)));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        var a = db.GetByMediaKey("AF1QipKeyA_000000000")!;
+        Assert.Equal(SyncItemStatus.PendingRemoteDelete, a.Status);
+        Assert.Equal(string.Empty, a.LocalFileName);
+
+        // Další cyklus nesmí záznam A vrátit do stavu Downloaded kvůli souboru fotky B
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+        Assert.Equal(SyncItemStatus.PendingRemoteDelete, db.GetByMediaKey("AF1QipKeyA_000000000")!.Status);
+    }
+
+    [Fact]
+    public void DetectMissing_PersistentMissingRecord_DoesNotStarveHashBackfill()
+    {
+        var (cfg, db, dir) = CreateTwoWaySetup("BackfillWhileMissing");
+        var path = Path.Combine(dir, "stara.jpg");
+        File.WriteAllBytes(path, new byte[] { 9, 9, 9 });
+        db.UpsertItem(Record("AF1QipLegacy_0000000", "stara.jpg", 3));
+        db.UpsertItem(Record("AF1QipNoSize_0000000", "nezname.jpg", 0)); // trvale nejednoznačný
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Equal(ExifService.ComputeFastFileHash(path), db.GetByMediaKey("AF1QipLegacy_0000000")!.FileHash);
+    }
+
+    [Fact]
+    public void DetectMissing_ForeignFileOnHashlessPath_IsNotBackfilledAsItsIdentity()
+    {
+        // Záznam A bez hashe (velikost 5); na jeho cestu se přesunula chybějící fotka B (velikost 4).
+        // Hash B se nesmí zapsat jako identita A a B nesmí do koše.
+        var (cfg, db, dir) = CreateTwoWaySetup("ForeignOnHashless");
+        var bytesB = new byte[] { 2, 2, 2, 2 };
+        File.WriteAllBytes(Path.Combine(dir, "a.jpg"), bytesB);
+        db.UpsertItem(Record("AF1QipKeyA_000000000", "a.jpg", 5));
+        db.UpsertItem(Record("AF1QipKeyB_000000000", "b.jpg", 4, Sha(bytesB)));
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Equal(string.Empty, db.GetByMediaKey("AF1QipKeyA_000000000")!.FileHash);
+        Assert.Empty(db.GetItemsByStatus(SyncItemStatus.PendingRemoteDelete));
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. KOLO AUDITU
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void ValidateDownloadedMediaFile_RejectsJsonAndTextErrorResponses()
+    {
+        var json = Path.Combine(_tempRoot, "chyba.jpg");
+        File.WriteAllText(json, "{\"error\":{\"code\":403,\"message\":\"Forbidden\"}}");
+        Assert.False(ExifService.ValidateDownloadedMediaFile(json, "chyba.jpg", expectedVideo: false).IsValid);
+
+        var text = Path.Combine(_tempRoot, "gone.mts");
+        File.WriteAllText(text, "Gone: the requested resource is no longer available " + new string('x', 400));
+        Assert.False(ExifService.ValidateDownloadedMediaFile(text, "gone.mts", expectedVideo: true).IsValid);
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0x49, 0x49, 0x2A, 0x00, 8, 0, 0, 0 })]                    // TIFF / DNG / NEF
+    [InlineData(new byte[] { 0x4D, 0x4D, 0x00, 0x2A, 0, 0, 0, 8 })]                    // TIFF big-endian
+    [InlineData(new byte[] { 0, 0, 0, 0x18, (byte)'f', (byte)'t', (byte)'y', (byte)'p', (byte)'h', (byte)'e', (byte)'i', (byte)'c' })] // HEIC
+    [InlineData(new byte[] { 0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0 })]                    // MKV / WebM
+    public void IsKnownMediaHeader_AcceptsCommonPhotoAndVideoFormats(byte[] header)
+    {
+        Assert.True(ExifService.IsKnownMediaHeader(header));
+    }
+
+    [Fact]
+    public void BindEvidenceToAccount_AccountChange_UnlinksPreviousEvidence()
+    {
+        var db = new SyncDatabase(Path.Combine(_tempRoot, "account.db"));
+        db.UpsertItem(Record("AF1QipAccount_000000", "a.jpg", 4, Sha(new byte[] { 1, 2, 3, 4 })));
+
+        Assert.Equal(0, SyncEngine.BindEvidenceToAccount(db, "prvni@gmail.com"));   // první spárování
+        Assert.Equal(0, SyncEngine.BindEvidenceToAccount(db, "PRVNI@gmail.com"));   // stejný účet
+        Assert.Equal(SyncItemStatus.Downloaded, db.GetByMediaKey("AF1QipAccount_000000")!.Status);
+
+        Assert.Equal(1, SyncEngine.BindEvidenceToAccount(db, "druhy@gmail.com"));   // jiný účet
+        Assert.Equal(SyncItemStatus.SkippedInitial, db.GetByMediaKey("AF1QipAccount_000000")!.Status);
+        Assert.Equal("druhy@gmail.com", db.GetState(SyncEngine.StateKeyAccountEmail));
+    }
+
+    [Fact]
+    public void ValidateDownloadedMediaFile_UnknownBinaryFormat_IsAcceptedNotBlockedForever()
+    {
+        var mov = Path.Combine(_tempRoot, "stare.mov");
+        File.WriteAllBytes(mov, new byte[] { 0, 0, 0, 8, (byte)'j', (byte)'u', (byte)'n', (byte)'k', 0, 0, 0, 0 });
+        Assert.True(ExifService.ValidateDownloadedMediaFile(mov, "stare.mov", expectedVideo: true).IsValid);
+
+        var unknownRaw = Path.Combine(_tempRoot, "neznamy.x3f");
+        File.WriteAllBytes(unknownRaw, new byte[] { (byte)'F', (byte)'O', (byte)'V', (byte)'b', 0, 0, 2, 0, 1, 0 });
+        Assert.True(ExifService.ValidateDownloadedMediaFile(unknownRaw, "neznamy.x3f", expectedVideo: false).IsValid);
+    }
+
+    [Theory]
+    [InlineData("Jan.Novak+fotky@googlemail.com", "jannovak@gmail.com")]
+    [InlineData("PRVNI@Firma.cz", "prvni@firma.cz")]
+    public void NormalizeGoogleEmail_TreatsGmailVariantsAsSameAccount(string input, string expected)
+    {
+        Assert.Equal(expected, SyncEngine.NormalizeGoogleEmail(input));
+    }
+
+    [Fact]
+    public void BindEvidenceToAccount_GmailAliasOfSameAccount_DoesNotUnlink()
+    {
+        var db = new SyncDatabase(Path.Combine(_tempRoot, "account_alias.db"));
+        db.UpsertItem(Record("AF1QipAlias_00000000", "a.jpg", 4, Sha(new byte[] { 1, 2, 3, 4 })));
+        SyncEngine.BindEvidenceToAccount(db, "jan.novak@gmail.com");
+
+        Assert.Equal(0, SyncEngine.BindEvidenceToAccount(db, "JanNovak@googlemail.com"));
+        Assert.Equal(SyncItemStatus.Downloaded, db.GetByMediaKey("AF1QipAlias_00000000")!.Status);
+    }
 }

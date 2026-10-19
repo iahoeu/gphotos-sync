@@ -17,6 +17,8 @@ public class GoogleLoginForm : Form
     public GoogleLoginForm(GooglePhotosEngine photosEngine)
     {
         _photosEngine = photosEngine;
+        // Přihlašovací okno může přepnout účet -> dřívější ruční potvrzení e-mailu už neplatí
+        _photosEngine.ClearConfirmedSessionAccountEmail();
 
         Text = "Přihlášení k účtu Google Photos";
         Width = 980;

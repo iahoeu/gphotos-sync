@@ -147,7 +147,7 @@ public static class ExifService
             return (false, "Stažený soubor je prázdný (0 B).");
         }
 
-        int headerLen = (int)Math.Min(64L, fi.Length);
+        int headerLen = (int)Math.Min(512L, fi.Length);
         byte[] header = new byte[headerLen];
         try
         {
@@ -174,6 +174,18 @@ public static class ExifService
         bool isImageHeader = IsStaticImageHeader(header);
         var ext = Path.GetExtension(fileName);
 
+        // Ověření obsahu: textová odpověď (JSON, HTML, prostý text) místo média se nesmí uložit jako stažená fotka.
+        // Neznámý binární formát (vzácné RAW, starší kontejnery) se přijme s varováním, aby se stahování
+        // takové položky nezablokovalo napořád.
+        if (!IsKnownMediaHeader(header))
+        {
+            if (LooksLikeText(header))
+            {
+                return (false, $"Namísto fotky nebo videa byl stažen textový soubor (pravděpodobně chybová odpověď) – '{fileName}'.");
+            }
+            Logger.Warn($"Stažený soubor '{fileName}' má nerozpoznanou hlavičku formátu – přijímám ho jako binární médium.");
+        }
+
         if (expectedVideo)
         {
             if (isImageHeader || (KnownImageExtensions.Contains(ext) && !KnownVideoExtensions.Contains(ext)))
@@ -183,6 +195,81 @@ public static class ExifService
         }
 
         return (true, null);
+    }
+
+    /// <summary>
+    /// Hlavička vypadá jako text (JSON, HTML, XML, prostý text): žádné nulové bajty a téměř jen tisknutelné znaky.
+    /// Hlavičky fotek a videí obsahují nulové a řídicí bajty.
+    /// </summary>
+    public static bool LooksLikeText(ReadOnlySpan<byte> h)
+    {
+        if (h.Length == 0)
+            return true;
+
+        int printable = 0;
+        foreach (var b in h)
+        {
+            if (b == 0x00)
+                return false;
+            if (b == 0x09 || b == 0x0A || b == 0x0D || (b >= 0x20 && b <= 0x7E) || b >= 0x80)
+                printable++;
+        }
+        return printable >= h.Length * 0.95;
+    }
+
+    public static bool IsKnownMediaHeader(ReadOnlySpan<byte> h)
+    {
+        if (IsStaticImageHeader(h))
+            return true;
+
+        static bool AtSpan(ReadOnlySpan<byte> span, int offset, string ascii)
+        {
+            if (span.Length < offset + ascii.Length) return false;
+            for (int i = 0; i < ascii.Length; i++)
+                if (span[offset + i] != (byte)ascii[i]) return false;
+            return true;
+        }
+
+        // TIFF a RAW založené na TIFF (DNG, CR2, NEF, ARW): "II*\0" / "MM\0*"; Olympus ORF "IIRO"/"IIRS"; Panasonic RW2 "IIU\0"
+        if (h.Length >= 4 && h[0] == 0x49 && h[1] == 0x49 &&
+            ((h[2] == 0x2A && h[3] == 0x00) || (h[2] == (byte)'R' && (h[3] == (byte)'O' || h[3] == (byte)'S')) || (h[2] == (byte)'U' && h[3] == 0x00)))
+            return true;
+        if (h.Length >= 4 && h[0] == 0x4D && h[1] == 0x4D && h[2] == 0x00 && h[3] == 0x2A)
+            return true;
+        // BMP ("BM" + rezervované nulové bajty 6–9)
+        if (h.Length >= 10 && AtSpan(h, 0, "BM") && h[6] == 0 && h[7] == 0 && h[8] == 0 && h[9] == 0)
+            return true;
+        // ISO BMFF (HEIC/HEIF/AVIF, MP4, MOV, 3GP, CR3) a starší QuickTime atomy
+        if (AtSpan(h, 4, "ftyp") || AtSpan(h, 4, "moov") || AtSpan(h, 4, "mdat") || AtSpan(h, 4, "wide") || AtSpan(h, 4, "free") ||
+            AtSpan(h, 4, "skip") || AtSpan(h, 4, "pnot") || AtSpan(h, 4, "junk") || AtSpan(h, 4, "uuid") || AtSpan(h, 4, "styp"))
+            return true;
+        // MPEG-1/2 video (elementary stream)
+        if (h.Length >= 4 && h[0] == 0x00 && h[1] == 0x00 && h[2] == 0x01 && h[3] == 0xB3)
+            return true;
+        // JPEG XL (codestream FF 0A nebo kontejner "JXL ")
+        if ((h.Length >= 2 && h[0] == 0xFF && h[1] == 0x0A) || AtSpan(h, 4, "JXL "))
+            return true;
+        // AVI (RIFF....AVI )
+        if (AtSpan(h, 0, "RIFF") && AtSpan(h, 8, "AVI "))
+            return true;
+        // Matroska / WebM
+        if (h.Length >= 4 && h[0] == 0x1A && h[1] == 0x45 && h[2] == 0xDF && h[3] == 0xA3)
+            return true;
+        // MPEG-TS (MTS): synchronizační bajt 0x47 každých 188 B; M2TS: každých 192 B s posunem 4
+        if ((h.Length >= 189 && h[0] == 0x47 && h[188] == 0x47) ||
+            (h.Length >= 197 && h[4] == 0x47 && h[196] == 0x47))
+            return true;
+        // MPEG-PS
+        if (h.Length >= 4 && h[0] == 0x00 && h[1] == 0x00 && h[2] == 0x01 && h[3] == 0xBA)
+            return true;
+        // ASF / WMV
+        if (h.Length >= 4 && h[0] == 0x30 && h[1] == 0x26 && h[2] == 0xB2 && h[3] == 0x75)
+            return true;
+        // Fujifilm RAF
+        if (AtSpan(h, 0, "FUJIFILM"))
+            return true;
+
+        return false;
     }
 
     public static bool IsStaticImageHeader(ReadOnlySpan<byte> header)

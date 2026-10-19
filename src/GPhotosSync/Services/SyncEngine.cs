@@ -20,6 +20,8 @@ public class SyncEngine : IDisposable
     private const int PeriodicFullScanIntervalDays = 7;
     private const int IdleSecondsRequiredForFullScan = 600; // 10 minut nečinnosti PC
 
+    public const string StateKeyFolderId = "FolderId";
+    public const string StateKeyAccountEmail = "AccountEmail";
     private const string StateKeyBaselineResume = "BaselineResumeMediaKey";
     private const string StateKeyTimelineResume = "TimelineResumeMediaKey";
     private const string StateKeyFullScanCursor = "FullScanCursorMediaKey";
@@ -36,6 +38,7 @@ public class SyncEngine : IDisposable
     private int _pendingBulkDeleteCount;
     private string? _blockedBulkDeleteBatchId;
     private bool _isDeletePausedDueToUnverifiedAccount;
+    private bool _scanDepthLimitNotified;
     private string? _unverifiedAccountReason;
     private CancellationTokenSource? _currentSyncCts;
     private Task _activeOperationTask = Task.CompletedTask;
@@ -112,6 +115,70 @@ public class SyncEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// Evidence stažených fotek patří účtu, ze kterého byly staženy. Když se očekávaný účet změní, dosavadní
+    /// evidence se odpojí od mazání (smazání souboru na PC nesmí mazat v jiném účtu) a vazba se přepíše.
+    /// Vrací počet odpojených položek.
+    /// </summary>
+    public static int BindEvidenceToAccount(SyncDatabase db, string? expectedEmail)
+    {
+        if (string.IsNullOrWhiteSpace(expectedEmail))
+            return 0;
+
+        var email = expectedEmail.Trim();
+        var stored = db.GetState(StateKeyAccountEmail);
+        if (string.Equals(NormalizeGoogleEmail(stored), NormalizeGoogleEmail(email), StringComparison.Ordinal))
+            return 0;
+
+        int unlinked = 0;
+        if (!string.IsNullOrWhiteSpace(stored))
+        {
+            unlinked = db.UnlinkDownloadedItemsFromDeletion();
+            Logger.Warn($"Účet Google se změnil ('{stored}' -> '{email}'): {unlinked} dříve stažených položek bylo odpojeno od mazání (patří původnímu účtu).");
+        }
+
+        db.SetState(StateKeyAccountEmail, email);
+        return unlinked;
+    }
+
+    /// <summary>
+    /// Stejný účet Google může být zapsán různě (velikost písmen, tečky a +alias u Gmailu, googlemail.com).
+    /// </summary>
+    public static string NormalizeGoogleEmail(string? email)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+            return string.Empty;
+
+        var e = email.Trim().ToLowerInvariant();
+        int at = e.LastIndexOf('@');
+        if (at <= 0)
+            return e;
+
+        var local = e[..at];
+        var domain = e[(at + 1)..];
+        if (domain is "gmail.com" or "googlemail.com")
+        {
+            int plus = local.IndexOf('+');
+            if (plus >= 0) local = local[..plus];
+            local = local.Replace(".", "");
+            domain = "gmail.com";
+        }
+        return $"{local}@{domain}";
+    }
+
+    private void EnsureEvidenceBoundToAccount()
+    {
+        int unlinked = BindEvidenceToAccount(_db, _config.ExpectedGoogleAccountEmail);
+        if (unlinked > 0)
+        {
+            RefreshBulkDeleteStateFromDatabase();
+            ShowNotification?.Invoke(
+                "Změna účtu Google",
+                $"Dříve stažené fotky ({unlinked}) patří původnímu účtu – jejich smazání na PC už se v Google Photos neprovede.",
+                ToolTipIcon.Warning);
+        }
+    }
+
     public void ConfirmGoogleAccountEmailManually(string email)
     {
         if (string.IsNullOrWhiteSpace(email))
@@ -164,6 +231,7 @@ public class SyncEngine : IDisposable
 
     public void UpdateConfiguration()
     {
+        EnsureEvidenceBoundToAccount();
         RefreshBulkDeleteStateFromDatabase();
         RefreshAccountDeleteVerificationState();
         SetupFileSystemWatcher();
@@ -295,7 +363,28 @@ public class SyncEngine : IDisposable
 
         var check = config.VerifyDownloadFolderIdentity(hasDownloaded, AnyTrackedFileOnDisk);
         errorMessage = check.ErrorMessage;
-        return check.IsValid;
+        if (!check.IsValid)
+            return false;
+
+        // Identita složky uložená v databázi chrání evidenci i proti configu, který ukazuje na jinou
+        // (např. dřívější) složku s vlastním platným markerem – typicky obnova ze zálohy config.json.bak.
+        var storedFolderId = db.GetState(StateKeyFolderId);
+        if (string.IsNullOrWhiteSpace(storedFolderId) || !hasDownloaded)
+        {
+            if (!string.Equals(storedFolderId, config.FolderId, StringComparison.Ordinal))
+            {
+                db.SetState(StateKeyFolderId, config.FolderId);
+            }
+            return true;
+        }
+
+        if (!string.Equals(storedFolderId, config.FolderId, StringComparison.Ordinal))
+        {
+            errorMessage = $"Cílová složka '{config.DownloadFolder}' neodpovídá složce, ke které patří evidence stažených fotek. Synchronizace a mazání byly zastaveny." + AppConfig.FolderRecoveryHint;
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -373,6 +462,7 @@ public class SyncEngine : IDisposable
             {
                 _config.ExpectedGoogleAccountEmail = loginCheck.DetectedEmail;
                 _config.Save();
+                EnsureEvidenceBoundToAccount();
                 Logger.Info($"Spárován a uložen účet Google Photos: {loginCheck.DetectedEmail}");
                 loginCheck.IsAccountVerifiedForDelete = true;
             }
@@ -408,7 +498,18 @@ public class SyncEngine : IDisposable
 
     private async Task<(int TrashedCount, int FailedCount, bool BlockedByBulkSafeguard, int AmbiguousCount)> ExecuteVerifiedTwoWayDeletionsInternalAsync(CancellationToken ct)
     {
+        EnsureEvidenceBoundToAccount();
+        int sessionVersionAtStart = _photosEngine.AccountSessionVersion;
+
         var detectRes = DetectMissingLocalFilesForTwoWayDelete(_config, _db);
+        if (!detectRes.SearchCompleted)
+        {
+            // Bez úplného prohledání složky nelze vyloučit, že "chybějící" soubory existují jinde -> nemazat nic,
+            // ani položky, které už dříve čekaly na smazání.
+            Logger.Error("Mazání v Google Photos zastaveno: kontrolu sledované složky se nepodařilo dokončit.");
+            RaiseStatus("Mazání zastaveno – nelze ověřit obsah sledované složky (viz protokol)", isSyncing: false, hasError: true);
+            return (0, 1, false, detectRes.AmbiguousSkippedCount);
+        }
 
         int maxAuto = Math.Max(1, _config.MaxAutoDeletesPerCycle);
         var batchEval = _db.EvaluateOrLockBulkDeleteBatch(maxAuto);
@@ -421,7 +522,7 @@ public class SyncEngine : IDisposable
             _blockedBulkDeleteBatchId = batchEval.BlockedBatchId;
             _pendingBulkDeleteCount = batchEval.BlockedItems.Count;
 
-            var warnMsg = $"Zjištěno odebrání {_pendingBulkDeleteCount} fotek v dávce '{_blockedBulkDeleteBatchId}' (limit pojistky je {maxAuto}). Potvrďte prosím mazání u ikony v liště.";
+            var warnMsg = $"Zjištěno odebrání {_pendingBulkDeleteCount} fotek v dávce '{_blockedBulkDeleteBatchId}' (limit pojistky je {maxAuto}). Potvrďte prosím mazání u ikony v liště. Do rozhodnutí čekají i ostatní mazání v Google Photos.";
             Logger.Warn(warnMsg);
             RaiseStatus($"Čeká na potvrzení smazání {_pendingBulkDeleteCount} fotek (klikněte pravým na ikonu)", isSyncing: false, hasError: true);
 
@@ -429,7 +530,7 @@ public class SyncEngine : IDisposable
             {
                 ShowNotification?.Invoke(
                     "Pojistka hromadného mazání Google Photos",
-                    $"V dávce čeká na smazání {_pendingBulkDeleteCount} souborů. Klikněte pravým tlačítkem na ikonu u hodin pro potvrzení nebo zrušení přesunu do koše.",
+                    $"V dávce čeká na smazání {_pendingBulkDeleteCount} souborů. Klikněte pravým tlačítkem na ikonu u hodin pro potvrzení nebo zrušení přesunu do koše. Do rozhodnutí čekají i ostatní mazání.",
                     ToolTipIcon.Warning);
             }
 
@@ -454,6 +555,19 @@ public class SyncEngine : IDisposable
         {
             ct.ThrowIfCancellationRequested();
 
+            if (!_config.TwoWayDelete)
+            {
+                Logger.Info("Obousměrné mazání bylo vypnuto – zbytek dávky se nemaže.");
+                break;
+            }
+
+            if (_photosEngine.AccountSessionVersion != sessionVersionAtStart)
+            {
+                Logger.Warn("Během mazání mohl být změněn účet Google (otevřeno přihlášení nebo prohlížeč) – zbytek dávky se nemaže.");
+                failedCount++;
+                break;
+            }
+
             // Znovu ověřit identitu složky před každou mazanou položkou
             if (!VerifyFolderAndConfigSafety(out var folderErr))
             {
@@ -462,11 +576,23 @@ public class SyncEngine : IDisposable
                 break;
             }
 
-            // Double-check the file didn't reappear in folder or subfolders
+            // Soubor se mezitím vrátil na evidovanou cestu? Jako svůj ho přijmout jen při shodě obsahu,
+            // jinak (cizí nebo nečitelný soubor) nemazat a nechat rozhodnutí na další kontrole.
             var localPath = Path.Combine(_config.DownloadFolder, item.LocalFileName);
-            if (File.Exists(localPath))
+            if (!string.IsNullOrWhiteSpace(item.LocalFileName) && File.Exists(localPath))
             {
-                _db.UpdateStatus(item.MediaKey, SyncItemStatus.Downloaded);
+                var currentHash = string.IsNullOrEmpty(item.FileHash) ? "" : ExifService.ComputeFastFileHash(localPath);
+                if (string.IsNullOrEmpty(item.FileHash) ||
+                    string.Equals(currentHash, item.FileHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    _db.UpdateStatus(item.MediaKey, SyncItemStatus.Downloaded);
+                }
+                else
+                {
+                    // Nemazat; vrátit do evidence a nechat další kontrolu rozhodnout podle obsahu souborů
+                    Logger.Warn($"Na cestě '{item.LocalFileName}' se objevil soubor s jiným obsahem – položka '{item.MediaKey}' se nemaže a vrací se ke kontrole.");
+                    _db.UpdateStatus(item.MediaKey, SyncItemStatus.Downloaded);
+                }
                 continue;
             }
 
@@ -503,21 +629,21 @@ public class SyncEngine : IDisposable
     /// - SHA-256 hash celého souboru + velikost má PŘEDNOST před názvem + velikostí.
     /// - Nejednoznačná shoda (víc kandidátů, chybí hash) = NEMAZAT a nahlásit.
     /// </summary>
-    public static (int MissingMarkedCount, int AmbiguousSkippedCount) DetectMissingLocalFilesForTwoWayDelete(AppConfig config, SyncDatabase db)
+    public static (int MissingMarkedCount, int AmbiguousSkippedCount, bool SearchCompleted) DetectMissingLocalFilesForTwoWayDelete(AppConfig config, SyncDatabase db)
     {
         if (!config.TwoWayDelete || config.HasConfigLoadError || string.IsNullOrWhiteSpace(config.DownloadFolder))
-            return (0, 0);
+            return (0, 0, false);
 
         if (!VerifyFolderAndConfigSafety(config, db, out _))
-            return (0, 0);
+            return (0, 0, false);
 
         var downloadedItems = db.GetItemsByStatus(SyncItemStatus.Downloaded);
         var pendingItems = db.GetItemsByStatus(SyncItemStatus.PendingRemoteDelete);
 
         var allCandidatesToCheck = new List<SyncItemRecord>();
-        var activeKnownRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var presentRecords = new List<(SyncItemRecord Record, string FullPath, string RelativePath)>();
 
-        foreach (var item in downloadedItems)
+        foreach (var item in downloadedItems.Concat(pendingItems))
         {
             if (string.IsNullOrWhiteSpace(item.LocalFileName))
                 continue;
@@ -525,7 +651,7 @@ public class SyncEngine : IDisposable
             var fullPath = Path.Combine(config.DownloadFolder, item.LocalFileName);
             if (File.Exists(fullPath))
             {
-                activeKnownRelativePaths.Add(SyncDatabase.NormalizePathKey(item.LocalFileName));
+                presentRecords.Add((item, fullPath, SyncDatabase.NormalizePathKey(item.LocalFileName)));
             }
             else
             {
@@ -533,25 +659,64 @@ public class SyncEngine : IDisposable
             }
         }
 
-        foreach (var pending in pendingItems)
+        if (allCandidatesToCheck.Count == 0)
         {
-            if (string.IsNullOrWhiteSpace(pending.LocalFileName))
-                continue;
-
-            var fullPath = Path.Combine(config.DownloadFolder, pending.LocalFileName);
-            if (File.Exists(fullPath))
-            {
-                db.UpdateStatus(pending.MediaKey, SyncItemStatus.Downloaded);
-                activeKnownRelativePaths.Add(SyncDatabase.NormalizePathKey(pending.LocalFileName));
-            }
-            else
-            {
-                allCandidatesToCheck.Add(pending);
-            }
+            // Nic nechybí -> soubory na evidovaných cestách lze považovat za své a doplnit jim hash
+            RevertPresentPendingItems(db, presentRecords);
+            BackfillMissingHashes(db, downloadedItems, config.DownloadFolder);
+            return (0, 0, true);
         }
 
-        if (allCandidatesToCheck.Count == 0)
-            return (0, 0);
+        // Soubor na evidované cestě nemusí patřit tomuto záznamu: na cestu smazané fotky mohla být
+        // přesunuta jiná chybějící fotka. Má-li soubor velikost některého chybějícího záznamu, ověří se hash.
+        // Neshoda = soubor se zařadí do hledání (záznam zůstává, dokud si soubor neprokáže jiný záznam
+        // shodou hashe); bez hashe nebo při chybě čtení nelze identitu ověřit.
+        var missingSizes = new HashSet<long>(allCandidatesToCheck.Where(x => x.FileSize > 0).Select(x => x.FileSize));
+        var unverifiableSizes = new HashSet<long>();
+        var suspectFilesByPath = new Dictionary<string, SyncItemRecord>(StringComparer.OrdinalIgnoreCase);
+        var activeKnownRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var safeForBackfill = new List<SyncItemRecord>();
+
+        foreach (var (record, fullPath, relPath) in presentRecords)
+        {
+            long diskLength;
+            try { diskLength = new FileInfo(fullPath).Length; }
+            catch { diskLength = -1; }
+
+            if (diskLength < 0 || !missingSizes.Contains(diskLength))
+            {
+                activeKnownRelativePaths.Add(relPath);
+                if (diskLength >= 0)
+                    safeForBackfill.Add(record);
+                continue;
+            }
+
+            var diskHash = string.IsNullOrEmpty(record.FileHash) ? "" : ExifService.ComputeFastFileHash(fullPath);
+            if (string.IsNullOrEmpty(diskHash))
+            {
+                // Záznam bez hashe nebo nečitelný soubor -> nelze vyloučit, že jde o jinou chybějící fotku
+                unverifiableSizes.Add(diskLength);
+                activeKnownRelativePaths.Add(relPath);
+                continue;
+            }
+
+            if (string.Equals(diskHash, record.FileHash, StringComparison.OrdinalIgnoreCase))
+            {
+                activeKnownRelativePaths.Add(relPath);
+                continue;
+            }
+
+            suspectFilesByPath[relPath] = record;
+            Logger.Warn($"Obsah souboru '{record.LocalFileName}' neodpovídá evidenci (jiný SHA-256 hash) – soubor se ověří proti chybějícím záznamům.");
+        }
+
+        RevertPresentPendingItems(db, presentRecords);
+
+        // Hash doplnit i když něco chybí (jinak by trvale chybějící záznam doplňování zablokoval), ale jen
+        // u souborů, jejichž skutečná velikost na disku neodpovídá žádnému chybějícímu záznamu – ty nemohou být
+        // cizí (chybějící) fotkou přesunutou na tuto cestu.
+        BackfillMissingHashes(db, safeForBackfill, config.DownloadFolder);
 
         // Sestavit seznam všech neobsazených souborů ve sledované složce a jejích podsložkách
         var unmatchedDiskFiles = new List<(string FullPath, string RelativePath, string FileName, long Length, DateTime LastWriteTime, string? ComputedHash, DateTime? ComputedDate)>();
@@ -570,32 +735,58 @@ public class SyncEngine : IDisposable
         catch (Exception ex)
         {
             Logger.Error($"Nelze prohledat podsložky '{config.DownloadFolder}' před mazáním: {ex.Message}");
-            return (0, 0);
+            return (0, 0, false);
         }
 
         int missingMarkedCount = 0;
         int ambiguousSkippedCount = 0;
 
-        foreach (var item in allCandidatesToCheck)
+        // Záznamy s uloženým hashem zpracovat jako první (i ty, které se přidají za běhu): shoda hashe je jediný
+        // důkaz totožnosti a soubor, který si takto přivlastní, už nemůže zablokovat ani přiřadit jiný záznam.
+        var displacedKeys = new HashSet<string>(StringComparer.Ordinal);
+        var hashedQueue = new Queue<SyncItemRecord>(allCandidatesToCheck.Where(x => !string.IsNullOrEmpty(x.FileHash)));
+        var noHashQueue = new Queue<SyncItemRecord>(allCandidatesToCheck.Where(x => string.IsNullOrEmpty(x.FileHash)));
+
+        while (hashedQueue.Count > 0 || noHashQueue.Count > 0)
         {
+            var item = hashedQueue.Count > 0 ? hashedQueue.Dequeue() : noHashQueue.Dequeue();
             var expectedFileName = Path.GetFileName(item.LocalFileName);
             int matchedIndex = -1;
             bool isAmbiguous = false;
+            string ambiguousReason = "";
 
-            if (!string.IsNullOrEmpty(item.FileHash))
+            if (item.FileSize <= 0)
             {
-                // 1. PRIORITA: Hledání podle velikosti + SHA-256 hashe celého souboru (má přednost před názvem + velikostí)
+                isAmbiguous = true;
+                ambiguousReason = "v evidenci chybí velikost souboru";
+            }
+            else if (unverifiableSizes.Contains(item.FileSize))
+            {
+                isAmbiguous = true;
+                ambiguousReason = "ve složce je soubor shodné velikosti, jehož identitu nelze ověřit";
+            }
+            else if (!string.IsNullOrEmpty(item.FileHash))
+            {
+                // Přiřazení výhradně podle shody SHA-256 hashe celého souboru
                 var hashMatches = new List<int>();
+                bool anyHashUnreadable = false;
                 for (int i = 0; i < unmatchedDiskFiles.Count; i++)
                 {
                     var cand = unmatchedDiskFiles[i];
-                    if (item.FileSize > 0 && cand.Length != item.FileSize)
+                    if (cand.Length != item.FileSize)
                         continue;
 
                     var hash = cand.ComputedHash ?? ExifService.ComputeFastFileHash(cand.FullPath);
                     unmatchedDiskFiles[i] = cand with { ComputedHash = hash };
 
-                    if (!string.IsNullOrEmpty(hash) && string.Equals(hash, item.FileHash, StringComparison.OrdinalIgnoreCase))
+                    if (string.IsNullOrEmpty(hash))
+                    {
+                        // Soubor nelze přečíst (např. zamčený jiným programem) -> jeho identitu nelze ověřit
+                        anyHashUnreadable = true;
+                        continue;
+                    }
+
+                    if (string.Equals(hash, item.FileHash, StringComparison.OrdinalIgnoreCase))
                     {
                         hashMatches.Add(i);
                     }
@@ -612,59 +803,19 @@ public class SyncEngine : IDisposable
                         string.Equals(unmatchedDiskFiles[idx].FileName, expectedFileName, StringComparison.OrdinalIgnoreCase), -1);
                     matchedIndex = sameNameIdx >= 0 ? sameNameIdx : hashMatches[0];
                 }
-            }
-            else
-            {
-                // 2. Položka nemá uložený SHA-256 hash: hledat kandidáty, ale při jakékoliv nejednoznačnosti NEMAZAT a nahlásit
-                var sameSizeIndices = new List<int>();
-                var nameAndSizeIndices = new List<int>();
-                var dateAndSizeIndices = new List<int>();
-
-                for (int i = 0; i < unmatchedDiskFiles.Count; i++)
+                else if (anyHashUnreadable)
                 {
-                    var cand = unmatchedDiskFiles[i];
-                    bool sizeOk = item.FileSize <= 0 || cand.Length == item.FileSize;
-                    if (!sizeOk)
-                        continue;
-
-                    if (item.FileSize > 0)
-                    {
-                        sameSizeIndices.Add(i);
-                    }
-
-                    if (string.Equals(cand.FileName, expectedFileName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        nameAndSizeIndices.Add(i);
-                    }
-
-                    if (item.TakenAt.HasValue && item.FileSize > 0)
-                    {
-                        var exifOrNameDate = cand.ComputedDate
-                                             ?? ExifService.TryReadExifDate(cand.FullPath)
-                                             ?? ExifService.TryParseDateFromFileName(Path.GetFileNameWithoutExtension(cand.FileName));
-                        unmatchedDiskFiles[i] = cand with { ComputedDate = exifOrNameDate };
-
-                        if ((exifOrNameDate.HasValue && Math.Abs((exifOrNameDate.Value - item.TakenAt.Value).TotalSeconds) < 2) ||
-                            Math.Abs((cand.LastWriteTime - item.TakenAt.Value).TotalSeconds) < 2)
-                        {
-                            dateAndSizeIndices.Add(i);
-                        }
-                    }
-                }
-
-                if (nameAndSizeIndices.Count == 1 && sameSizeIndices.Count <= 1)
-                {
-                    matchedIndex = nameAndSizeIndices[0];
-                }
-                else if (nameAndSizeIndices.Count == 0 && dateAndSizeIndices.Count == 1 && sameSizeIndices.Count == 1)
-                {
-                    matchedIndex = dateAndSizeIndices[0];
-                }
-                else if (nameAndSizeIndices.Count > 1 || dateAndSizeIndices.Count > 1 || sameSizeIndices.Count > 0)
-                {
-                    // Chybí hash a existuje více kandidátů (nebo nejednoznačný kandidát stejné velikosti bez potvrzení hashem)
                     isAmbiguous = true;
+                    ambiguousReason = "některý soubor shodné velikosti nelze přečíst a ověřit jeho hash";
                 }
+            }
+            else if (unmatchedDiskFiles.Any(cand => cand.Length == item.FileSize))
+            {
+                // Položka nemá uložený hash: název ani velikost nejsou důkazem totožnosti.
+                // Existuje-li jakýkoliv soubor shodné velikosti, nelze vyloučit, že jde o tuto fotku -> NEMAZAT
+                // a soubor ani nepřiřazovat (mohl by patřit jinému záznamu).
+                isAmbiguous = true;
+                ambiguousReason = "v DB chybí SHA-256 hash a ve složce existuje soubor shodné velikosti";
             }
 
             if (isAmbiguous)
@@ -674,7 +825,7 @@ public class SyncEngine : IDisposable
                 {
                     db.UpdateStatus(item.MediaKey, SyncItemStatus.Downloaded);
                 }
-                Logger.Warn($"Nejednoznačná shoda pro chybějící soubor '{item.LocalFileName}' (MediaKey: {item.MediaKey}, v DB chybí SHA-256 hash a ve složce existují kandidáti shodné velikosti). Položka se z bezpečnostních důvodů NEMAŽE.");
+                Logger.Warn($"Nelze ověřit identitu chybějícího souboru '{item.LocalFileName}' (MediaKey: {item.MediaKey}): {ambiguousReason}. Položka se z bezpečnostních důvodů NEMAŽE.");
                 continue;
             }
 
@@ -687,22 +838,99 @@ public class SyncEngine : IDisposable
                 var newHash = matched.ComputedHash ?? (string.IsNullOrEmpty(item.FileHash) ? ExifService.ComputeFastFileHash(matched.FullPath) : item.FileHash);
                 db.UpdateLocalFileLocationAndHash(item.MediaKey, matched.RelativePath, newHash);
                 Logger.Info($"Soubor '{item.LocalFileName}' byl nalezen jako přesunutý/přejmenovaný v cílové složce ('{matched.RelativePath}') -> v Google Photos se nemaže.");
+
+                // Soubor ležel na cestě jiného záznamu -> ten svůj soubor nemá a musí se dohledat
+                if (suspectFilesByPath.Remove(matched.RelativePath, out var displaced))
+                {
+                    displacedKeys.Add(displaced.MediaKey);
+                    (string.IsNullOrEmpty(displaced.FileHash) ? noHashQueue : hashedQueue).Enqueue(displaced);
+                }
                 continue;
             }
 
-            if (item.Status == SyncItemStatus.Downloaded)
-            {
-                // Ignore if downloaded less than 10 seconds ago
-                if ((DateTime.Now - item.UpdatedAt).TotalSeconds < 10)
-                    continue;
+            // Ignore if downloaded less than 10 seconds ago
+            if (!displacedKeys.Contains(item.MediaKey) && (DateTime.Now - item.UpdatedAt).TotalSeconds < 10)
+                continue;
 
+            if (displacedKeys.Contains(item.MediaKey))
+            {
+                // Evidovanou cestu tohoto záznamu teď prokazatelně zabírá jiná fotka -> cestu zrušit, aby kontrola
+                // "soubor se vrátil" před mazáním nenašla cizí soubor
+                Logger.Info($"Na cestě '{item.LocalFileName}' je jiná fotka a vlastní soubor nebyl nalezen -> zařazuji k přesunu do koše Google Photos.");
+                item.LocalFileName = string.Empty;
+                item.Status = SyncItemStatus.PendingRemoteDelete;
+                item.UpdatedAt = DateTime.Now;
+                db.UpsertItem(item);
+                missingMarkedCount++;
+            }
+            else if (item.Status != SyncItemStatus.PendingRemoteDelete)
+            {
                 Logger.Info($"Soubor '{item.LocalFileName}' již není v synchronizované složce (ani v podsložkách) -> zařazuji k přesunu do koše Google Photos.");
                 db.UpdateStatus(item.MediaKey, SyncItemStatus.PendingRemoteDelete);
                 missingMarkedCount++;
             }
         }
 
-        return (missingMarkedCount, ambiguousSkippedCount);
+        return (missingMarkedCount, ambiguousSkippedCount, true);
+    }
+
+    private static void RevertPresentPendingItems(SyncDatabase db, List<(SyncItemRecord Record, string FullPath, string RelativePath)> presentRecords)
+    {
+        foreach (var (record, _, _) in presentRecords)
+        {
+            if (record.Status == SyncItemStatus.PendingRemoteDelete)
+            {
+                db.UpdateStatus(record.MediaKey, SyncItemStatus.Downloaded);
+                record.Status = SyncItemStatus.Downloaded;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fotky ze dne instalace a novější do výchozího stavu nepatří: zaznamenávání může běžet přes více cyklů
+    /// a fotka pořízená mezitím by se jinak už nikdy nestáhla. Položky bez data do výchozího stavu patří.
+    /// </summary>
+    public static bool BelongsToBaseline(DateTime? estimatedDate, DateTime installedAt)
+    {
+        return !estimatedDate.HasValue || estimatedDate.Value.Date < installedAt.Date;
+    }
+
+    private const int MaxHashBackfillPerCycle = 100;
+    private static readonly TimeSpan MaxHashBackfillDuration = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Dopočítá chybějící SHA-256 hash u stažených souborů, které jsou stále na disku (záznamy ze starších verzí).
+    /// Bez hashe nelze přejmenovaný soubor bezpečně rozpoznat, proto se hash doplňuje, dokud soubor existuje.
+    /// </summary>
+    private static void BackfillMissingHashes(SyncDatabase db, List<SyncItemRecord> downloadedItems, string downloadFolder)
+    {
+        int computed = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        foreach (var item in downloadedItems)
+        {
+            // Omezit počet i čas, aby doplňování (např. u velkých videí) nezdrželo cyklus ani UI
+            if (computed >= MaxHashBackfillPerCycle || sw.Elapsed > MaxHashBackfillDuration)
+                break;
+            if (!string.IsNullOrEmpty(item.FileHash) || string.IsNullOrWhiteSpace(item.LocalFileName))
+                continue;
+
+            var fullPath = Path.Combine(downloadFolder, item.LocalFileName);
+            if (!File.Exists(fullPath))
+                continue;
+
+            var hash = ExifService.ComputeFastFileHash(fullPath);
+            computed++;
+            if (!string.IsNullOrEmpty(hash))
+            {
+                db.UpdateLocalFileLocationAndHash(item.MediaKey, item.LocalFileName, hash);
+                item.FileHash = hash;
+            }
+        }
+
+        if (computed > 0)
+        {
+            Logger.Info($"Doplněn SHA-256 hash u {computed} dříve stažených souborů.");
+        }
     }
 
     public Task RunSyncCycleAsync(bool manualTrigger)
@@ -773,6 +1001,8 @@ public class SyncEngine : IDisposable
             {
                 _config.ExpectedGoogleAccountEmail = loginRes.DetectedEmail;
                 _config.Save();
+                // Vazbu evidence na účet zpracovat hned, ještě před stahováním nového účtu
+                EnsureEvidenceBoundToAccount();
                 loginRes.IsAccountVerifiedForDelete = true;
                 Logger.Info($"Spárován a uložen účet Google Photos: {loginRes.DetectedEmail}");
             }
@@ -816,6 +1046,7 @@ public class SyncEngine : IDisposable
                 : _config.GetCutoffDate();
 
             bool isInitialBaselineCapture = _config.InitialMode == InitialSyncMode.OnlyNewFromNow && !_config.BaselineCaptured;
+            bool scanDepthLimitHit = false;
             bool scanAllHistory = _config.InitialMode == InitialSyncMode.AllHistory;
 
             if (isInitialBaselineCapture)
@@ -838,6 +1069,9 @@ public class SyncEngine : IDisposable
 
                 foreach (var item in baselineScan.Items)
                 {
+                    if (!BelongsToBaseline(item.EstimatedDate, _config.InstalledAt))
+                        continue;
+
                     if (!_db.Exists(item.MediaKey))
                     {
                         _db.UpsertItem(new SyncItemRecord
@@ -855,6 +1089,8 @@ public class SyncEngine : IDisposable
                 }
 
                 // Bod 10: BaselineCaptured nastavit na true POUZE tehdy, když sken skutečně dosáhl konce knihovny
+                scanDepthLimitHit |= baselineScan.ResumeKeyNotReached;
+
                 if (baselineScan.ReachedTargetBoundary)
                 {
                     _db.SetState(StateKeyBaselineResume, null);
@@ -868,17 +1104,21 @@ public class SyncEngine : IDisposable
                     string? lastKey = baselineScan.Items.LastOrDefault()?.MediaKey;
                     _db.SetState(StateKeyBaselineResume, lastKey);
                     Logger.Info($"Zaznamenávání výchozího stavu ještě nedosáhlo konce knihovny (zpracováno {baselineScan.Items.Count} položek) – bude pokračovat v dalším cyklu.");
-                    RaiseStatus("Zaznamenávám výchozí stav knihovny (pokračování v dalším cyklu)...", isSyncing: false);
+
+                    // Do dokončení výchozího stavu stahovat jen fotky ze dne instalace a novější,
+                    // aby nové fotky nemusely čekat a staré se omylem nestáhly.
+                    cutoffDate = _config.InstalledAt.Date;
                 }
-                return;
             }
+
+            bool baselineIncomplete = isInitialBaselineCapture && !_config.BaselineCaptured;
 
             var discoveredByKey = new Dictionary<string, DiscoveredMediaItem>(StringComparer.Ordinal);
             string? timelineResumeKey = _db.GetState(StateKeyTimelineResume);
 
             // Bod 10b: Přednostně skenovat pohled „Nedávno přidané“ (/search/_tra_), který je řazen podle data nahrání,
             // aby se zachytily i nově nahrané fotky se starým EXIF datem pořízení.
-            if (string.IsNullOrWhiteSpace(timelineResumeKey))
+            if (string.IsNullOrWhiteSpace(timelineResumeKey) && !baselineIncomplete)
             {
                 var recentAddedScan = await _photosEngine.ScanRecentlyAddedAsync(
                     isAlreadyKnownMediaKey: _db.Exists,
@@ -891,6 +1131,10 @@ public class SyncEngine : IDisposable
                     {
                         discoveredByKey[item.MediaKey] = item;
                     }
+                }
+                else
+                {
+                    Logger.Warn($"Pohled 'Nedávno přidané' se nepodařilo přečíst ({recentAddedScan.ErrorMessage}) – nově nahrané fotky se starším datem pořízení se v tomto cyklu nezachytí.");
                 }
             }
 
@@ -914,6 +1158,8 @@ public class SyncEngine : IDisposable
                 return;
             }
 
+            scanDepthLimitHit |= scanResult.ResumeKeyNotReached;
+
             foreach (var item in scanResult.Items)
             {
                 if (!discoveredByKey.ContainsKey(item.MediaKey))
@@ -926,7 +1172,7 @@ public class SyncEngine : IDisposable
             // rozdělený do malých dávek, aby neblokoval mazání ani běžné stahování.
             bool ranFullScanBatch = false;
             bool fullScanIncomplete = false;
-            if (scanResult.ReachedTargetBoundary && string.IsNullOrWhiteSpace(timelineResumeKey) && ShouldRunPeriodicFullScanBatch(manualTrigger))
+            if (!baselineIncomplete && scanResult.ReachedTargetBoundary && string.IsNullOrWhiteSpace(timelineResumeKey) && ShouldRunPeriodicFullScanBatch(manualTrigger))
             {
                 ranFullScanBatch = true;
                 string? fullScanCursor = _db.GetState(StateKeyFullScanCursor);
@@ -942,6 +1188,7 @@ public class SyncEngine : IDisposable
 
                 if (fullScanBatch.Success)
                 {
+                    scanDepthLimitHit |= fullScanBatch.ResumeKeyNotReached;
                     foreach (var item in fullScanBatch.Items)
                     {
                         if (!discoveredByKey.ContainsKey(item.MediaKey))
@@ -1044,7 +1291,7 @@ public class SyncEngine : IDisposable
                     var item = itemsToDownloadThisCycle[i];
 
                     cutoffDate = _config.InitialMode == InitialSyncMode.OnlyNewFromNow
-                        ? null
+                        ? (baselineIncomplete ? _config.InstalledAt.Date : null)
                         : _config.GetCutoffDate();
 
                     if (cutoffDate.HasValue && item.EstimatedDate.HasValue && item.EstimatedDate.Value.Date < cutoffDate.Value.Date)
@@ -1164,7 +1411,8 @@ public class SyncEngine : IDisposable
             else if (scanResult.ReachedTargetBoundary && !downloadBatchTruncated && failedDownloads == 0)
             {
                 _db.SetState(StateKeyTimelineResume, null);
-                if (!_config.BaselineCaptured)
+                // Výchozí stav režimu "jen nové" smí dokončit jen jeho vlastní úplný sken
+                if (!_config.BaselineCaptured && !baselineIncomplete)
                 {
                     _config.BaselineCaptured = true;
                     _config.Save();
@@ -1192,13 +1440,26 @@ public class SyncEngine : IDisposable
             {
                 RaiseStatus($"Dokončeno s upozorněním: chyby stahování ({failedDownloads}), mazání ({failedDeletes}), nejednoznačné ({ambiguousDeletes})", isSyncing: false, hasError: true);
             }
+            else if (scanDepthLimitHit)
+            {
+                const string depthMsg = "Kontrola knihovny nedosáhla místa, kde skončil minulý sken (velká knihovna nebo pomalé načítání stránky). Starší část historie se zatím nekontroluje.";
+                Logger.Warn(depthMsg);
+                RaiseStatus("Neúplná kontrola knihovny – starší historie se nekontroluje (viz protokol)", isSyncing: false, hasError: true);
+                if (!_scanDepthLimitNotified)
+                {
+                    _scanDepthLimitNotified = true;
+                    ShowNotification?.Invoke("Neúplná kontrola knihovny Google Photos", depthMsg, ToolTipIcon.Warning);
+                }
+            }
             else if (hasMoreTimelineWork || (ranFullScanBatch && fullScanIncomplete))
             {
+                _scanDepthLimitNotified = false;
                 Logger.Info("Časová osa obsahuje další položky – skenování bude pokračovat v dalším cyklu.");
                 RaiseStatus($"Stažena dávka ({DateTime.Now:HH:mm}) – pokračování v dalším cyklu", isSyncing: false);
             }
             else
             {
+                _scanDepthLimitNotified = false;
                 RaiseStatus($"Synchronizováno ({DateTime.Now:HH:mm})", isSyncing: false);
             }
         }

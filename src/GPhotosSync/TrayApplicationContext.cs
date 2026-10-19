@@ -95,6 +95,11 @@ public class TrayApplicationContext : ApplicationContext
         {
             _config.TwoWayDelete = _twoWayToggleMenuItem.Checked;
             _config.Save();
+            if (!_config.TwoWayDelete)
+            {
+                // Rozběhnutá dávka mazání kontroluje nastavení před každou položkou; zrušit i probíhající cyklus
+                _syncEngine.CancelCurrentSync();
+            }
             _syncEngine.UpdateConfiguration();
             _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
             Logger.Info($"Obousměrné mazání bylo {(_config.TwoWayDelete ? "ZAPNUTO" : "VYPNUTO")}.");
@@ -102,6 +107,10 @@ public class TrayApplicationContext : ApplicationContext
 
         var loginItem = new ToolStripMenuItem("🔑 Účet Google Photos (Přihlášení)...", null, async (_, _) =>
         {
+            // Přihlašovací okno sdílí profil prohlížeče se synchronizací -> nejdřív ji zastavit
+            await _syncEngine.StopAndWaitForIdleAsync();
+            try
+            {
             using var loginForm = new GoogleLoginForm(_photosEngine);
             loginForm.ShowDialog();
             if (loginForm.LoginSucceeded)
@@ -116,6 +125,11 @@ public class TrayApplicationContext : ApplicationContext
                 {
                     SettingsForm.PromptManualGoogleAccountConfirmation(null, _config, _syncEngine, _photosEngine);
                 }
+            }
+            }
+            finally
+            {
+                _syncEngine.UpdateConfiguration();
             }
             _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
             await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
