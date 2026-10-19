@@ -1818,20 +1818,33 @@ public class GooglePhotosEngine : IDisposable
     }
 
     /// <summary>
-    /// Detail fotky, která leží v koši, nabízí tlačítko „Obnovit“ / „Restore“ (případně je otevřen přes /trash/).
+    /// Text, podle kterého Google Photos označuje položku v koši. Ověřeno na VM: detail fotky v koši
+    /// ukazuje ovládací prvek „Zbývá 30 dnů, než bude položka trvale smazána“; anglicky obdobně „… days left …“.
+    /// </summary>
+    public static bool IsTrashIndicatorText(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        return Regex.IsMatch(text,
+            @"Zbývá\s+\d+\s+(dn|den)|trvale smazán|(\d+\s+days?\s+(left|remaining|until))|permanently deleted|(^|\s)(Obnovit|Restore)(\s|$)",
+            RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// Je otevřený detail fotky v koši? (adresa /trash/ nebo popisek ovládacího prvku „Zbývá N dnů, než bude
+    /// položka trvale smazána“, případně tlačítko „Obnovit“).
     /// </summary>
     private async Task<bool> IsPhotoInTrashAsync(string mediaKey)
     {
-        var script = @"
+        const string script = @"
             (() => {
                 const path = window.location.pathname || '';
-                if (path.includes('/trash')) return true;
-                const els = Array.from(document.querySelectorAll('button, [role=""button""]'))
-                    .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
-                return els.some(b => {
-                    const t = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
-                    return /(^|\s)(Obnovit|Restore)(\s|$)/i.test(t);
-                });
+                const labels = Array.from(document.querySelectorAll('button, [role=""button""]'))
+                    .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0)
+                    .map(b => ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).replace(/\s+/g, ' ').trim())
+                    .filter(t => t);
+                return JSON.stringify({ inTrashPath: path.includes('/trash'), labels: labels });
             })();
         ";
         try
@@ -1839,7 +1852,22 @@ public class GooglePhotosEngine : IDisposable
             var currentUrl = _webView.CoreWebView2.Source ?? "";
             if (!currentUrl.Contains(mediaKey, StringComparison.Ordinal))
                 return false;
-            return await _webView.CoreWebView2.ExecuteScriptAsync(script) == "true";
+
+            var raw = await _webView.CoreWebView2.ExecuteScriptAsync(script);
+            var json = JsonSerializer.Deserialize<string>(raw ?? "\"\"");
+            if (string.IsNullOrWhiteSpace(json))
+                return false;
+
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.GetProperty("inTrashPath").GetBoolean())
+                return true;
+
+            foreach (var label in doc.RootElement.GetProperty("labels").EnumerateArray())
+            {
+                if (IsTrashIndicatorText(label.GetString()))
+                    return true;
+            }
+            return false;
         }
         catch
         {

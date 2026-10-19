@@ -1022,4 +1022,18 @@ public class AuditLogicTests : IDisposable
 
         Assert.Empty(db.GetItemsByStatus(SyncItemStatus.PendingRemoteDelete));
     }
+
+    [Theory]
+    [InlineData("Zbývá 30 dnů, než bude položka trvale smazána", true)]   // skutečný popisek z VM
+    [InlineData(" / Zbývá 1 den, než bude položka trvale smazána", true)]
+    [InlineData("30 days left until this item is permanently deleted", true)]
+    [InlineData("Obnovit", true)]
+    [InlineData("Přesunout do koše", false)]
+    [InlineData("Otevřít informace", false)]
+    [InlineData("Další možnosti", false)]
+    [InlineData("Obnovíte 3 MB ze svého úložiště účtu Google", false)]
+    public void IsTrashIndicatorText_RecognizesTrashDetailLabel(string text, bool expected)
+    {
+        Assert.Equal(expected, GooglePhotosEngine.IsTrashIndicatorText(text));
+    }
 }
