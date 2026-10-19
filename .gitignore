@@ -4,6 +4,7 @@ obj/
 artifacts/
 src/GPhotosSync.Installer/payload.zip
 _migrace_chatu/
+.gitea_token
 
 # IDE & OS files
 .vs/

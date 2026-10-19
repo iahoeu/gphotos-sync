@@ -34,8 +34,8 @@ public class AppConfig
     // Gitea Auto-Update Configuration
     public bool AutoCheckUpdates { get; set; } = true;
     public bool AutoInstallUpdates { get; set; } = false;
-    public string GiteaServerUrl { get; set; } = ""; // např. https://git.mojedomena.cz
-    public string GiteaRepoOwner { get; set; } = ""; // např. jahoda
+    public string GiteaServerUrl { get; set; } = "https://git.iaho.eu";
+    public string GiteaRepoOwner { get; set; } = "iaho";
     public string GiteaRepoName { get; set; } = "gphotos-sync";
     public string GiteaAccessToken { get; set; } = ""; // volitelné pro privátní repozitář
 

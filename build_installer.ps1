@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
-$env:PATH = "C:\Users\jahoda\scoop\apps\dotnet-sdk\current;$env:PATH"
+$scoopDotnet = Join-Path $env:USERPROFILE "scoop\apps\dotnet-sdk\current"
+if (Test-Path $scoopDotnet) {
+    $env:PATH = "$scoopDotnet;$env:PATH"
+}
 
 $root = $PSScriptRoot
 $publishAppDir = Join-Path $root "artifacts\app_publish"

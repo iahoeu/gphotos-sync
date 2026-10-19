@@ -474,7 +474,10 @@ public class InstallerForm : Form
                 DownloadFolder = photosDir,
                 TwoWayDelete = _chkTwoWayDelete.Checked,
                 DownloadVideos = _chkVideos.Checked,
-                InitialMode = initialModeStr
+                InitialMode = initialModeStr,
+                GiteaServerUrl = "https://git.iaho.eu",
+                GiteaRepoOwner = "iaho",
+                GiteaRepoName = "gphotos-sync"
             };
             File.WriteAllText(
                 Path.Combine(appDataDir, "installer_defaults.json"),
@@ -559,9 +562,11 @@ public class InstallerForm : Form
             using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall\GPhotosSync");
             if (key == null) return;
 
+            var ver = Assembly.GetExecutingAssembly().GetName().Version ?? new Version(1, 0, 0);
+            var verStr = $"{ver.Major}.{ver.Minor}.{Math.Max(0, ver.Build)}";
             var uninstallerExe = Path.Combine(installDir, "Uninstall.exe");
             key.SetValue("DisplayName", "Google Photos Sync pro Windows");
-            key.SetValue("DisplayVersion", "1.0.0");
+            key.SetValue("DisplayVersion", verStr);
             key.SetValue("Publisher", "GPhotosSync");
             key.SetValue("DisplayIcon", targetExe);
             key.SetValue("InstallLocation", installDir);
