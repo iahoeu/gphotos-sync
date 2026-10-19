@@ -18,6 +18,77 @@ public class DiscoveredMediaItem
     public bool DiscoveredFromRecentlyAdded { get; set; }
 }
 
+public enum TimelineScanDecision
+{
+    Continue,
+    KnownBoundaryReached,
+    PossibleEnd
+}
+
+/// <summary>
+/// Čistá (testovatelná) logika rozhodování při posouvání časové osy: kolik kroků zbývá, kdy je dosažena
+/// vrstva již známých položek a kdy může jít o konec knihovny. Kroky potřebné k dosažení místa, kde skončil
+/// minulý sken, se nepočítají do limitu dávky (mají vlastní strop).
+/// </summary>
+public sealed class TimelineScanProgress
+{
+    public const int DefaultMaxResumeSeekSteps = 600;
+
+    private readonly int _maxScanSteps;
+    private readonly int _maxResumeSeekSteps;
+    private readonly bool _scanAllHistory;
+    private readonly int _minStepsBeforeEarlyStop;
+    private int _consecutiveStepsWithoutNewItems;
+    private int _consecutiveStepsAllKnownOrOlder;
+
+    public TimelineScanProgress(int maxScanSteps, bool scanAllHistory, bool hasResumeKey, int maxResumeSeekSteps = DefaultMaxResumeSeekSteps)
+    {
+        _maxScanSteps = Math.Max(1, maxScanSteps);
+        _maxResumeSeekSteps = Math.Max(0, maxResumeSeekSteps);
+        _scanAllHistory = scanAllHistory;
+        _minStepsBeforeEarlyStop = scanAllHistory ? 10 : 3;
+        PassedResumeKey = !hasResumeKey;
+    }
+
+    public bool PassedResumeKey { get; private set; }
+    public int ScanSteps { get; private set; }
+    public int TotalSteps { get; private set; }
+
+    public bool CanContinue => ScanSteps < _maxScanSteps && TotalSteps < _maxScanSteps + _maxResumeSeekSteps;
+    public bool ShouldScroll => CanContinue;
+    public bool ShouldGiveUpWithoutConfirmedEnd => _consecutiveStepsWithoutNewItems >= 8;
+
+    public void MarkResumeKeyReached() => PassedResumeKey = true;
+
+    public TimelineScanDecision RecordStep(int newlyAddedItems, int newUnseenCandidates)
+    {
+        TotalSteps++;
+        if (PassedResumeKey)
+            ScanSteps++;
+
+        if (newlyAddedItems == 0)
+        {
+            _consecutiveStepsWithoutNewItems++;
+        }
+        else
+        {
+            _consecutiveStepsWithoutNewItems = 0;
+            if (!_scanAllHistory && PassedResumeKey && newUnseenCandidates == 0)
+                _consecutiveStepsAllKnownOrOlder++;
+            else
+                _consecutiveStepsAllKnownOrOlder = 0;
+        }
+
+        if (!_scanAllHistory && PassedResumeKey && ScanSteps >= _minStepsBeforeEarlyStop && _consecutiveStepsAllKnownOrOlder >= 2)
+            return TimelineScanDecision.KnownBoundaryReached;
+
+        if (TotalSteps >= _minStepsBeforeEarlyStop && _consecutiveStepsWithoutNewItems >= 4)
+            return TimelineScanDecision.PossibleEnd;
+
+        return TimelineScanDecision.Continue;
+    }
+}
+
 public class TimelineScanResult
 {
     public bool Success { get; set; }
@@ -26,6 +97,11 @@ public class TimelineScanResult
     public bool ReachedTargetBoundary { get; set; } = false;
     public string? LastScannedMediaKey { get; set; }
     public DateTime? OldestScannedDate { get; set; }
+
+    /// <summary>
+    /// Místo, kde skončil minulý sken, nebylo v limitu posunu dosaženo -> hlubší část knihovny se nekontroluje.
+    /// </summary>
+    public bool ResumeKeyNotReached { get; set; }
 }
 
 public class AccountCheckResult
@@ -716,25 +792,18 @@ public class GooglePhotosEngine : IDisposable
                 };
             }
 
-            int consecutiveStepsWithoutNewItems = 0;
-            int consecutiveStepsAllKnownOrOlder = 0;
             bool reachedBoundary = false;
-            bool passedResumeKey = string.IsNullOrWhiteSpace(resumeAfterMediaKey);
-            int minStepsBeforeEarlyStop = scanAllHistory ? 10 : 3;
             string? lastScannedKey = null;
             DateTime? oldestScannedDate = null;
 
-            // Kroky potřebné k dosažení místa, kde minulý sken skončil (resumeAfterMediaKey), se nepočítají
-            // do limitu skenu – jinak by se kurzor nikdy nedostal hlouběji než na první limit.
-            const int maxResumeSeekSteps = 600;
+            var progress = new TimelineScanProgress(maxScrollStepsLimit, scanAllHistory, hasResumeKey: !string.IsNullOrWhiteSpace(resumeAfterMediaKey));
             var maxResumeSeekDuration = TimeSpan.FromMinutes(5);
             var seekStopwatch = System.Diagnostics.Stopwatch.StartNew();
-            int scanSteps = 0;
 
-            for (int step = 0; scanSteps < maxScrollStepsLimit && step < maxScrollStepsLimit + maxResumeSeekSteps; step++)
+            while (progress.CanContinue)
             {
                 // Posun k místu minulého skenu drží zámek prohlížeče (blokuje mazání i stahování) -> omezit i časem
-                if (!passedResumeKey && seekStopwatch.Elapsed > maxResumeSeekDuration)
+                if (!progress.PassedResumeKey && seekStopwatch.Elapsed > maxResumeSeekDuration)
                     break;
 
                 ct.ThrowIfCancellationRequested();
@@ -748,9 +817,9 @@ public class GooglePhotosEngine : IDisposable
                     if (string.IsNullOrEmpty(key))
                         continue;
 
-                    if (!passedResumeKey && string.Equals(key, resumeAfterMediaKey, StringComparison.Ordinal))
+                    if (!progress.PassedResumeKey && string.Equals(key, resumeAfterMediaKey, StringComparison.Ordinal))
                     {
-                        passedResumeKey = true;
+                        progress.MarkResumeKeyReached();
                     }
 
                     if (itemsById.ContainsKey(key))
@@ -785,39 +854,18 @@ public class GooglePhotosEngine : IDisposable
                     }
                 }
 
-                if (passedResumeKey)
-                {
-                    scanSteps++;
-                }
+                var decision = progress.RecordStep(newlyAddedInStep, newUnseenCandidateCountInStep);
+                Logger.Info($"Skenování časové osy (krok {progress.TotalSteps}{(progress.PassedResumeKey ? "" : ", posun k místu minulého skenu")}): doposud nalezeno {itemsById.Count} položek (+{newlyAddedInStep} v tomto kroku).");
 
-                Logger.Info($"Skenování časové osy (krok {step + 1}{(passedResumeKey ? "" : ", posun k místu minulého skenu")}): doposud nalezeno {itemsById.Count} položek (+{newlyAddedInStep} v tomto kroku).");
-
-                if (newlyAddedInStep == 0)
-                {
-                    consecutiveStepsWithoutNewItems++;
-                }
-                else
-                {
-                    consecutiveStepsWithoutNewItems = 0;
-                    if (!scanAllHistory && passedResumeKey && newUnseenCandidateCountInStep == 0)
-                    {
-                        consecutiveStepsAllKnownOrOlder++;
-                    }
-                    else
-                    {
-                        consecutiveStepsAllKnownOrOlder = 0;
-                    }
-                }
-
-                // P1-9: Zastavit posouvání, jakmile jsme v běžném režimu (po překonání případného resume bodu) narazili na souvislou vrstvu již známých/starších položek
-                if (!scanAllHistory && passedResumeKey && scanSteps >= minStepsBeforeEarlyStop && consecutiveStepsAllKnownOrOlder >= 2)
+                // P1-9: v běžném režimu (po překonání případného resume bodu) souvislá vrstva již známých/starších položek
+                if (decision == TimelineScanDecision.KnownBoundaryReached)
                 {
                     reachedBoundary = true;
                     break;
                 }
 
-                // Bod 10: Pokud nepřibývají položky, ověřit skutečný konec knihovny v DOMu (žádný aktivní spinner, scroll na konci, stabilní výška)
-                if (step + 1 >= minStepsBeforeEarlyStop && consecutiveStepsWithoutNewItems >= 4)
+                // Bod 10: nepřibývají položky -> ověřit skutečný konec knihovny v DOMu
+                if (decision == TimelineScanDecision.PossibleEnd)
                 {
                     if (await VerifyTrueEndOfTimelineAsync(ct))
                     {
@@ -825,7 +873,7 @@ public class GooglePhotosEngine : IDisposable
                         break;
                     }
 
-                    if (consecutiveStepsWithoutNewItems >= 8)
+                    if (progress.ShouldGiveUpWithoutConfirmedEnd)
                     {
                         Logger.Warn("Skenování časové osy se zastavilo bez potvrzení konce knihovny (síť nebo DOM stále načítá) – bude pokračovat v dalším cyklu.");
                         reachedBoundary = false;
@@ -833,13 +881,13 @@ public class GooglePhotosEngine : IDisposable
                     }
                 }
 
-                if (scanSteps < maxScrollStepsLimit)
+                if (progress.ShouldScroll)
                 {
                     await ScrollTimelineStepAsync(ct);
                 }
             }
 
-            if (!passedResumeKey && !reachedBoundary)
+            if (!progress.PassedResumeKey && !reachedBoundary)
             {
                 Logger.Warn("Místo, kde skončil minulý sken časové osy, se nepodařilo v limitu dosáhnout – další cyklus naváže od nejhlubší dosažené položky.");
             }
@@ -860,7 +908,8 @@ public class GooglePhotosEngine : IDisposable
                 Items = itemsById.Values.ToList(),
                 ReachedTargetBoundary = reachedBoundary,
                 LastScannedMediaKey = lastScannedKey,
-                OldestScannedDate = oldestScannedDate
+                OldestScannedDate = oldestScannedDate,
+                ResumeKeyNotReached = !progress.PassedResumeKey && !reachedBoundary
             };
         }
         catch (OperationCanceledException)

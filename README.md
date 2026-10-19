@@ -9,12 +9,17 @@ Automatická synchronizace fotek a videí z **Google Photos** do složky ve Wind
 4. **Obousměrná synchronizace (Mazání / Přesunutí / Podsložky):**
    - **Zkopírování fotky (`Ctrl+C` -> `Ctrl+V`):** Fotka zůstává ve složce i v Google Photos.
    - **Přesunutí do podsložky nebo přejmenování uvnitř sledované složky:** Aplikace sleduje celou složku včetně všech jejích podsložek (podle SHA-256 otisku celého souboru a velikosti). Přesunutí do podsložky nebo přejmenování souboru uvnitř sledované složky pouze aktualizuje umístění v evidenci a fotku v Google Photos **nesmaže**.
-   - **Přesunutí mimo sledovanou složku (`Ctrl+X` / přetažení na jiné místo mimo strom sledované složky) nebo Smazání (`Delete`):** Fotka ze sledované složky i jejích podsložek zmizí -> aplikace ji automaticky přesune do **Koše v Google Photos** (kde zůstává ještě 60 dní pro případ omylu). Při větším počtu odebraných fotek najednou zasáhne bezpečnostní pojistka hromadného mazání a vyžádá si potvrzení u ikony v liště.
+   - **Přesunutí mimo sledovanou složku (`Ctrl+X` / přetažení na jiné místo mimo strom sledované složky) nebo Smazání (`Delete`):** Fotka ze sledované složky i jejích podsložek zmizí -> aplikace ji automaticky přesune do **Koše v Google Photos** (kde zůstává ještě 60 dní pro případ omylu). Při větším počtu odebraných fotek najednou zasáhne bezpečnostní pojistka hromadného mazání a vyžádá si potvrzení u ikony v liště. Do rozhodnutí čekají i ostatní mazání.
+   - **Přejmenování a zároveň úprava fotky (např. uložení v editoru pod jiným názvem):** Fotka se pozná jen podle otisku obsahu, upravený soubor ho má jiný. Pokud původní soubor zmizí, aplikace ho bere jako smazaný a fotku přesune do koše v Google Photos. Upravená kopie na disku zůstane.
+   - **Nejistota = nemazat:** Když nejde ověřit, že soubor opravdu zmizel (soubor bez otisku ze starší verze, zamčený soubor, chyba prohledání složky, neověřený účet Google), aplikace v Google Photos nic nesmaže a zapíše upozornění do protokolu.
+   - **Složka fotek** nesmí ležet v datové složce aplikace (`%LocalAppData%\GPhotosSync`) ani ji obsahovat.
 5. **Volba počáteční synchronizace při instalaci / prvním spuštění:**
    - Pouze nové fotky od této chvíle
    - Fotky za posledních X dní
    - Fotky od konkrétního data
    - Stáhnout celou historii
+   - Výchozí stav režimu „jen nové“ se zaznamenává postupně přes více cyklů; fotky ze dne instalace a novější se mezitím stahují.
+   - **Omezení hloubky:** časová osa se prochází posouváním webu od začátku. U velmi velké knihovny nemusí kontrola dosáhnout nejstarší historie (výchozí stav, „celá historie“, týdenní úplná kontrola). Aplikace to pak hlásí u ikony v liště a v protokolu jako „Neúplná kontrola knihovny“.
 6. **Automatická kontrola a tichá instalace aktualizací z Gitea (`git.iaho.eu`):**
    - Aplikace má ve výchozím stavu přednastavený server `https://git.iaho.eu` (repozitář `iaho/gphotos-sync`).
    - Kontroluje nejnovější vydání přes REST API (`/api/v1/repos/iaho/gphotos-sync/releases/latest`) a umí instalátor sama stáhnout a provést tichou aktualizaci (`--silent-update`).

@@ -591,6 +591,14 @@ public class SettingsForm : Form
             return false;
         }
 
+        if (AppConfig.OverlapsAppDataFolder(newFolder))
+        {
+            MessageBox.Show(owner,
+                $"Složka fotek nesmí ležet uvnitř datové složky aplikace ani ji obsahovat:\r\n{AppConfig.AppDataFolder}",
+                "Nepovolená složka", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
         var oldFolder = (config.DownloadFolder ?? "").Trim();
         bool isSameFolder = false;
         if (!string.IsNullOrWhiteSpace(oldFolder))
@@ -613,6 +621,21 @@ public class SettingsForm : Form
             if (string.IsNullOrWhiteSpace(config.FolderId))
             {
                 config.InitializeFolderMarker(newFolder);
+            }
+            else
+            {
+                // Obnova po přerušeném uložení: marker ve složce a identita v DB se shodují, jen config
+                // zůstal u předchozí identity -> po vědomém potvrzení složky uživatelem identitu převzít.
+                string? markerId = null;
+                try { markerId = File.ReadAllText(Path.Combine(newFolder, AppConfig.FolderMarkerFileName)).Trim(); } catch { }
+                var storedId = db?.GetState(SyncEngine.StateKeyFolderId);
+                if (!string.IsNullOrWhiteSpace(markerId) &&
+                    !string.Equals(markerId, config.FolderId, StringComparison.Ordinal) &&
+                    string.Equals(markerId, storedId, StringComparison.Ordinal))
+                {
+                    config.FolderId = markerId;
+                    Logger.Info($"Identita složky '{newFolder}' byla obnovena podle markeru a evidence v databázi.");
+                }
             }
             config.DownloadFolder = newFolder;
             return true;

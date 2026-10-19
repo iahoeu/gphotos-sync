@@ -52,11 +52,35 @@ public class AppConfig
 
     public const string FolderMarkerFileName = ".gphotossync_folder_id";
 
+    /// <summary>
+    /// Postup obnovy, který se připojuje ke všem chybám identity cílové složky.
+    /// </summary>
+    public const string FolderRecoveryHint =
+        " Postup: otevřete Nastavení, zvolte složku se staženými fotkami a uložte – aplikace ji ověří proti evidenci. " +
+        "Pokud složka k evidenci nepatří, aplikace nabídne odpojení evidence (v Google Photos se nic nesmaže).";
+
     public static string AppDataFolder => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "GPhotosSync");
 
     public static string ConfigFilePath => Path.Combine(AppDataFolder, "config.json");
+
+    /// <summary>
+    /// Složka fotek se nesmí překrývat s datovou složkou aplikace (odinstalace ji může mazat).
+    /// </summary>
+    public static bool OverlapsAppDataFolder(string folder)
+    {
+        try
+        {
+            var a = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var b = Path.GetFullPath(AppDataFolder).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return a.StartsWith(b, StringComparison.OrdinalIgnoreCase) || b.StartsWith(a, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return true;
+        }
+    }
     public static string WebViewProfileFolder => Path.Combine(AppDataFolder, "WebViewProfile");
     public static string DatabaseFilePath => Path.Combine(AppDataFolder, "sync_history.db");
     public static string LogFilePath => Path.Combine(AppDataFolder, "sync.log");
@@ -395,17 +419,17 @@ public class AppConfig
                 return (true, null);
             }
 
-            return (false, $"Ve složce '{DownloadFolder}' chybí identifikační soubor (.gphotossync_folder_id) i dříve stažené soubory. Mazání a synchronizace byly zastaveny.");
+            return (false, $"Ve složce '{DownloadFolder}' chybí identifikační soubor (.gphotossync_folder_id) i dříve stažené soubory. Mazání a synchronizace byly zastaveny." + FolderRecoveryHint);
         }
 
         if (string.IsNullOrWhiteSpace(diskMarkerId))
         {
-            return (false, $"Ve složce '{DownloadFolder}' chybí identifikační soubor (.gphotossync_folder_id). Složka mohla být nahrazena prázdnou složkou – mazání je zablokováno.");
+            return (false, $"Ve složce '{DownloadFolder}' chybí identifikační soubor (.gphotossync_folder_id). Složka mohla být nahrazena prázdnou složkou – mazání je zablokováno." + FolderRecoveryHint);
         }
 
         if (!string.Equals(FolderId.Trim(), diskMarkerId, StringComparison.Ordinal))
         {
-            return (false, $"Identita cílové složky '{DownloadFolder}' neodpovídá evidenci v databázi. Mazání je zablokováno.");
+            return (false, $"Identita cílové složky '{DownloadFolder}' neodpovídá konfiguraci. Synchronizace a mazání jsou zastaveny." + FolderRecoveryHint);
         }
 
         return (true, null);

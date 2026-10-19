@@ -228,10 +228,18 @@ public static class Program
             try { if (File.Exists(fp)) File.Delete(fp); } catch { }
         }
 
-        // Profil WebView2 (cookies přihlášení Google) vytváří výhradně aplikace
+        // Profil WebView2 (cookies přihlášení Google) mazat rekurzivně jen tehdy, když je známo, že se
+        // nepřekrývá se složkou fotek. Při neznámém umístění fotek se nechá být.
         var webViewDir = Path.Combine(appDataDir, "WebViewProfile");
-        if (Directory.Exists(webViewDir) &&
-            (string.IsNullOrWhiteSpace(photosDir) || !ArePathsOverlapping(webViewDir, photosDir)))
+        if (Directory.Exists(webViewDir) && string.IsNullOrWhiteSpace(photosDir))
+        {
+            MessageBox.Show(
+                $"Umístění složky s fotkami se nepodařilo zjistit, proto nebyl z bezpečnostních důvodů smazán profil prohlížeče:\r\n{webViewDir}\r\n\r\nPokud v něm nemáte fotky, můžete ho smazat ručně.",
+                "Profil prohlížeče ponechán",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        else if (Directory.Exists(webViewDir) && !ArePathsOverlapping(webViewDir, photosDir!))
         {
             try
             {
