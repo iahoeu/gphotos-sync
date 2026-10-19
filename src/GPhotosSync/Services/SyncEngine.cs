@@ -21,6 +21,7 @@ public class SyncEngine : IDisposable
     private const int IdleSecondsRequiredForFullScan = 600; // 10 minut nečinnosti PC
 
     public const string StateKeyFolderId = "FolderId";
+    public const string StateKeyAccountEmail = "AccountEmail";
     private const string StateKeyBaselineResume = "BaselineResumeMediaKey";
     private const string StateKeyTimelineResume = "TimelineResumeMediaKey";
     private const string StateKeyFullScanCursor = "FullScanCursorMediaKey";
@@ -114,6 +115,70 @@ public class SyncEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// Evidence stažených fotek patří účtu, ze kterého byly staženy. Když se očekávaný účet změní, dosavadní
+    /// evidence se odpojí od mazání (smazání souboru na PC nesmí mazat v jiném účtu) a vazba se přepíše.
+    /// Vrací počet odpojených položek.
+    /// </summary>
+    public static int BindEvidenceToAccount(SyncDatabase db, string? expectedEmail)
+    {
+        if (string.IsNullOrWhiteSpace(expectedEmail))
+            return 0;
+
+        var email = expectedEmail.Trim();
+        var stored = db.GetState(StateKeyAccountEmail);
+        if (string.Equals(NormalizeGoogleEmail(stored), NormalizeGoogleEmail(email), StringComparison.Ordinal))
+            return 0;
+
+        int unlinked = 0;
+        if (!string.IsNullOrWhiteSpace(stored))
+        {
+            unlinked = db.UnlinkDownloadedItemsFromDeletion();
+            Logger.Warn($"Účet Google se změnil ('{stored}' -> '{email}'): {unlinked} dříve stažených položek bylo odpojeno od mazání (patří původnímu účtu).");
+        }
+
+        db.SetState(StateKeyAccountEmail, email);
+        return unlinked;
+    }
+
+    /// <summary>
+    /// Stejný účet Google může být zapsán různě (velikost písmen, tečky a +alias u Gmailu, googlemail.com).
+    /// </summary>
+    public static string NormalizeGoogleEmail(string? email)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+            return string.Empty;
+
+        var e = email.Trim().ToLowerInvariant();
+        int at = e.LastIndexOf('@');
+        if (at <= 0)
+            return e;
+
+        var local = e[..at];
+        var domain = e[(at + 1)..];
+        if (domain is "gmail.com" or "googlemail.com")
+        {
+            int plus = local.IndexOf('+');
+            if (plus >= 0) local = local[..plus];
+            local = local.Replace(".", "");
+            domain = "gmail.com";
+        }
+        return $"{local}@{domain}";
+    }
+
+    private void EnsureEvidenceBoundToAccount()
+    {
+        int unlinked = BindEvidenceToAccount(_db, _config.ExpectedGoogleAccountEmail);
+        if (unlinked > 0)
+        {
+            RefreshBulkDeleteStateFromDatabase();
+            ShowNotification?.Invoke(
+                "Změna účtu Google",
+                $"Dříve stažené fotky ({unlinked}) patří původnímu účtu – jejich smazání na PC už se v Google Photos neprovede.",
+                ToolTipIcon.Warning);
+        }
+    }
+
     public void ConfirmGoogleAccountEmailManually(string email)
     {
         if (string.IsNullOrWhiteSpace(email))
@@ -166,6 +231,7 @@ public class SyncEngine : IDisposable
 
     public void UpdateConfiguration()
     {
+        EnsureEvidenceBoundToAccount();
         RefreshBulkDeleteStateFromDatabase();
         RefreshAccountDeleteVerificationState();
         SetupFileSystemWatcher();
@@ -396,6 +462,7 @@ public class SyncEngine : IDisposable
             {
                 _config.ExpectedGoogleAccountEmail = loginCheck.DetectedEmail;
                 _config.Save();
+                EnsureEvidenceBoundToAccount();
                 Logger.Info($"Spárován a uložen účet Google Photos: {loginCheck.DetectedEmail}");
                 loginCheck.IsAccountVerifiedForDelete = true;
             }
@@ -431,6 +498,9 @@ public class SyncEngine : IDisposable
 
     private async Task<(int TrashedCount, int FailedCount, bool BlockedByBulkSafeguard, int AmbiguousCount)> ExecuteVerifiedTwoWayDeletionsInternalAsync(CancellationToken ct)
     {
+        EnsureEvidenceBoundToAccount();
+        int sessionVersionAtStart = _photosEngine.AccountSessionVersion;
+
         var detectRes = DetectMissingLocalFilesForTwoWayDelete(_config, _db);
         if (!detectRes.SearchCompleted)
         {
@@ -485,6 +555,19 @@ public class SyncEngine : IDisposable
         {
             ct.ThrowIfCancellationRequested();
 
+            if (!_config.TwoWayDelete)
+            {
+                Logger.Info("Obousměrné mazání bylo vypnuto – zbytek dávky se nemaže.");
+                break;
+            }
+
+            if (_photosEngine.AccountSessionVersion != sessionVersionAtStart)
+            {
+                Logger.Warn("Během mazání mohl být změněn účet Google (otevřeno přihlášení nebo prohlížeč) – zbytek dávky se nemaže.");
+                failedCount++;
+                break;
+            }
+
             // Znovu ověřit identitu složky před každou mazanou položkou
             if (!VerifyFolderAndConfigSafety(out var folderErr))
             {
@@ -493,11 +576,23 @@ public class SyncEngine : IDisposable
                 break;
             }
 
-            // Double-check the file didn't reappear in folder or subfolders
+            // Soubor se mezitím vrátil na evidovanou cestu? Jako svůj ho přijmout jen při shodě obsahu,
+            // jinak (cizí nebo nečitelný soubor) nemazat a nechat rozhodnutí na další kontrole.
             var localPath = Path.Combine(_config.DownloadFolder, item.LocalFileName);
-            if (File.Exists(localPath))
+            if (!string.IsNullOrWhiteSpace(item.LocalFileName) && File.Exists(localPath))
             {
-                _db.UpdateStatus(item.MediaKey, SyncItemStatus.Downloaded);
+                var currentHash = string.IsNullOrEmpty(item.FileHash) ? "" : ExifService.ComputeFastFileHash(localPath);
+                if (string.IsNullOrEmpty(item.FileHash) ||
+                    string.Equals(currentHash, item.FileHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    _db.UpdateStatus(item.MediaKey, SyncItemStatus.Downloaded);
+                }
+                else
+                {
+                    // Nemazat; vrátit do evidence a nechat další kontrolu rozhodnout podle obsahu souborů
+                    Logger.Warn($"Na cestě '{item.LocalFileName}' se objevil soubor s jiným obsahem – položka '{item.MediaKey}' se nemaže a vrací se ke kontrole.");
+                    _db.UpdateStatus(item.MediaKey, SyncItemStatus.Downloaded);
+                }
                 continue;
             }
 
@@ -906,6 +1001,8 @@ public class SyncEngine : IDisposable
             {
                 _config.ExpectedGoogleAccountEmail = loginRes.DetectedEmail;
                 _config.Save();
+                // Vazbu evidence na účet zpracovat hned, ještě před stahováním nového účtu
+                EnsureEvidenceBoundToAccount();
                 loginRes.IsAccountVerifiedForDelete = true;
                 Logger.Info($"Spárován a uložen účet Google Photos: {loginRes.DetectedEmail}");
             }

@@ -136,6 +136,10 @@ public class SettingsForm : Form
         };
         btnAccount.Click += async (_, _) =>
         {
+            // Přihlašovací okno sdílí profil prohlížeče se synchronizací -> nejdřív ji zastavit
+            await _syncEngine.StopAndWaitForIdleAsync();
+            try
+            {
             using var loginForm = new GoogleLoginForm(_syncEngine.PhotosEngine);
             loginForm.ShowDialog(this);
             if (loginForm.LoginSucceeded)
@@ -150,6 +154,11 @@ public class SettingsForm : Form
                 {
                     PromptManualGoogleAccountConfirmation(this, _config, _syncEngine, _syncEngine.PhotosEngine);
                 }
+            }
+            }
+            finally
+            {
+                _syncEngine.UpdateConfiguration();
             }
         };
 

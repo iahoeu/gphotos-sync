@@ -906,4 +906,76 @@ public class AuditLogicTests : IDisposable
         Assert.Equal(string.Empty, db.GetByMediaKey("AF1QipKeyA_000000000")!.FileHash);
         Assert.Empty(db.GetItemsByStatus(SyncItemStatus.PendingRemoteDelete));
     }
+
+    // -------------------------------------------------------------------------
+    // 5. KOLO AUDITU
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void ValidateDownloadedMediaFile_RejectsJsonAndTextErrorResponses()
+    {
+        var json = Path.Combine(_tempRoot, "chyba.jpg");
+        File.WriteAllText(json, "{\"error\":{\"code\":403,\"message\":\"Forbidden\"}}");
+        Assert.False(ExifService.ValidateDownloadedMediaFile(json, "chyba.jpg", expectedVideo: false).IsValid);
+
+        var text = Path.Combine(_tempRoot, "gone.mts");
+        File.WriteAllText(text, "Gone: the requested resource is no longer available " + new string('x', 400));
+        Assert.False(ExifService.ValidateDownloadedMediaFile(text, "gone.mts", expectedVideo: true).IsValid);
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0x49, 0x49, 0x2A, 0x00, 8, 0, 0, 0 })]                    // TIFF / DNG / NEF
+    [InlineData(new byte[] { 0x4D, 0x4D, 0x00, 0x2A, 0, 0, 0, 8 })]                    // TIFF big-endian
+    [InlineData(new byte[] { 0, 0, 0, 0x18, (byte)'f', (byte)'t', (byte)'y', (byte)'p', (byte)'h', (byte)'e', (byte)'i', (byte)'c' })] // HEIC
+    [InlineData(new byte[] { 0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0 })]                    // MKV / WebM
+    public void IsKnownMediaHeader_AcceptsCommonPhotoAndVideoFormats(byte[] header)
+    {
+        Assert.True(ExifService.IsKnownMediaHeader(header));
+    }
+
+    [Fact]
+    public void BindEvidenceToAccount_AccountChange_UnlinksPreviousEvidence()
+    {
+        var db = new SyncDatabase(Path.Combine(_tempRoot, "account.db"));
+        db.UpsertItem(Record("AF1QipAccount_000000", "a.jpg", 4, Sha(new byte[] { 1, 2, 3, 4 })));
+
+        Assert.Equal(0, SyncEngine.BindEvidenceToAccount(db, "prvni@gmail.com"));   // první spárování
+        Assert.Equal(0, SyncEngine.BindEvidenceToAccount(db, "PRVNI@gmail.com"));   // stejný účet
+        Assert.Equal(SyncItemStatus.Downloaded, db.GetByMediaKey("AF1QipAccount_000000")!.Status);
+
+        Assert.Equal(1, SyncEngine.BindEvidenceToAccount(db, "druhy@gmail.com"));   // jiný účet
+        Assert.Equal(SyncItemStatus.SkippedInitial, db.GetByMediaKey("AF1QipAccount_000000")!.Status);
+        Assert.Equal("druhy@gmail.com", db.GetState(SyncEngine.StateKeyAccountEmail));
+    }
+
+    [Fact]
+    public void ValidateDownloadedMediaFile_UnknownBinaryFormat_IsAcceptedNotBlockedForever()
+    {
+        var mov = Path.Combine(_tempRoot, "stare.mov");
+        File.WriteAllBytes(mov, new byte[] { 0, 0, 0, 8, (byte)'j', (byte)'u', (byte)'n', (byte)'k', 0, 0, 0, 0 });
+        Assert.True(ExifService.ValidateDownloadedMediaFile(mov, "stare.mov", expectedVideo: true).IsValid);
+
+        var unknownRaw = Path.Combine(_tempRoot, "neznamy.x3f");
+        File.WriteAllBytes(unknownRaw, new byte[] { (byte)'F', (byte)'O', (byte)'V', (byte)'b', 0, 0, 2, 0, 1, 0 });
+        Assert.True(ExifService.ValidateDownloadedMediaFile(unknownRaw, "neznamy.x3f", expectedVideo: false).IsValid);
+    }
+
+    [Theory]
+    [InlineData("Jan.Novak+fotky@googlemail.com", "jannovak@gmail.com")]
+    [InlineData("PRVNI@Firma.cz", "prvni@firma.cz")]
+    public void NormalizeGoogleEmail_TreatsGmailVariantsAsSameAccount(string input, string expected)
+    {
+        Assert.Equal(expected, SyncEngine.NormalizeGoogleEmail(input));
+    }
+
+    [Fact]
+    public void BindEvidenceToAccount_GmailAliasOfSameAccount_DoesNotUnlink()
+    {
+        var db = new SyncDatabase(Path.Combine(_tempRoot, "account_alias.db"));
+        db.UpsertItem(Record("AF1QipAlias_00000000", "a.jpg", 4, Sha(new byte[] { 1, 2, 3, 4 })));
+        SyncEngine.BindEvidenceToAccount(db, "jan.novak@gmail.com");
+
+        Assert.Equal(0, SyncEngine.BindEvidenceToAccount(db, "JanNovak@googlemail.com"));
+        Assert.Equal(SyncItemStatus.Downloaded, db.GetByMediaKey("AF1QipAlias_00000000")!.Status);
+    }
 }

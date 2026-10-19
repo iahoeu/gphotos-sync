@@ -237,7 +237,15 @@ public class GooglePhotosEngine : IDisposable
     public void ClearConfirmedSessionAccountEmail()
     {
         _manuallyConfirmedSessionEmail = null;
+        Interlocked.Increment(ref _accountSessionVersion);
     }
+
+    /// <summary>
+    /// Zvyšuje se pokaždé, když mohl uživatel v prohlížeči změnit účet (přihlašovací okno, zobrazený prohlížeč).
+    /// Rozběhnutá dávka mazání se při změně zastaví.
+    /// </summary>
+    public int AccountSessionVersion => Volatile.Read(ref _accountSessionVersion);
+    private int _accountSessionVersion;
 
     private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -302,6 +310,7 @@ public class GooglePhotosEngine : IDisposable
     {
         // V zobrazeném prohlížeči lze přepnout účet -> dřívější ruční potvrzení e-mailu už neplatí
         _manuallyConfirmedSessionEmail = null;
+        Interlocked.Increment(ref _accountSessionVersion);
         _hostForm.ShowOnScreenForDiagnostics();
     }
 
