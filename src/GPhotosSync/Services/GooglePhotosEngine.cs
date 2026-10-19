@@ -1669,6 +1669,8 @@ public class GooglePhotosEngine : IDisposable
                 Logger.Warn($"Potvrzovací dialog pro '{mediaKey}' nebyl nalezen – ověřuji, zda Google Photos fotku přesto přesunulo do koše.");
             }
 
+            var afterClickSnapshot = await CaptureTrashDiagnosticsAsync();
+
             // 3. Bod 9: Ověřit skutečný výsledek přesunu do koše.
             // Pouhé opuštění URL NENÍ důkazem smazání! Vyžadujeme buď toast „Přesunuto do koše“,
             // nebo následné ověření nedostupnosti položky při novém načtení její URL.
@@ -1692,7 +1694,10 @@ public class GooglePhotosEngine : IDisposable
                         const urlChangedAway = !path.includes(expectedKey);
 
                         const bodyText = document.body ? (document.body.innerText || '') : '';
-                        const hasTrashToast = /Přesunuto do koše|Položka byla přesunuta do koše|Moved to trash|Moved to bin/i.test(bodyText);
+                        const live = Array.from(document.querySelectorAll('[role=""status""], [role=""alert""], [aria-live]'))
+                            .map(el => (el.innerText || el.textContent || '').trim()).join(' | ');
+                        const toastRe = /Přesunut[oaáy]? do koše|přesunut[oaáy]? do koše|Moved to (the )?(trash|bin)/i;
+                        const hasTrashToast = toastRe.test(bodyText) || toastRe.test(live);
                         const hasErrorToast = /Nelze přesunout do koše|Chyba při mazání|Can't move to trash|Couldn't delete/i.test(bodyText);
 
                         return JSON.stringify({{
@@ -1754,6 +1759,8 @@ public class GooglePhotosEngine : IDisposable
             }
 
             Logger.Error($"Nepodařilo se potvrdit, že položka '{mediaKey}' byla skutečně přesunuta do koše. Mazání se z bezpečnostních důvodů NEOPAKUJE – zkontrolujte koš v Google Photos.");
+            Logger.Warn($"Diagnostika mazání '{mediaKey}' – po potvrzení: {afterClickSnapshot}");
+            Logger.Warn($"Diagnostika mazání '{mediaKey}' – po novém načtení detailu: {await CaptureTrashDiagnosticsAsync()}");
             return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
         }
         catch (OperationCanceledException)
@@ -1768,6 +1775,45 @@ public class GooglePhotosEngine : IDisposable
         finally
         {
             _operationLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Diagnostický snímek stránky pro ladění ověření mazání (adresa, titulek, hlášky, popisky tlačítek).
+    /// Neobsahuje obsah fotek ani osobní údaje kromě textů ovládacích prvků.
+    /// </summary>
+    private async Task<string> CaptureTrashDiagnosticsAsync()
+    {
+        const string script = @"
+            (() => {
+                const vis = el => el.offsetParent !== null && el.getBoundingClientRect().width > 0;
+                const clip = (t, n) => (t || '').replace(/\s+/g, ' ').trim().slice(0, n);
+                const live = Array.from(document.querySelectorAll('[role=""status""], [role=""alert""], [aria-live]'))
+                    .map(el => clip(el.innerText || el.textContent, 120)).filter(t => t).slice(0, 6);
+                const dialogs = Array.from(document.querySelectorAll('[role=""dialog""], [role=""alertdialog""]'))
+                    .filter(vis).map(el => clip(el.innerText, 160)).slice(0, 3);
+                const buttons = Array.from(document.querySelectorAll('button, [role=""button""]')).filter(vis)
+                    .map(b => clip((b.getAttribute('aria-label') || '') + (b.innerText ? ' / ' + b.innerText : ''), 50))
+                    .filter(t => t && !t.includes('@')).slice(0, 30);
+                const body = document.body ? document.body.innerText || '' : '';
+                const kos = [];
+                const re = /.{0,40}(koš|trash|bin)\S*.{0,40}/gi;
+                let m;
+                while ((m = re.exec(body)) !== null && kos.length < 5) kos.push(clip(m[0], 90));
+                return JSON.stringify({
+                    url: location.href, title: document.title,
+                    live: live, dialogs: dialogs, buttons: buttons, kosTexts: kos
+                });
+            })();
+        ";
+        try
+        {
+            var raw = await _webView.CoreWebView2.ExecuteScriptAsync(script);
+            return JsonSerializer.Deserialize<string>(raw ?? "\"\"") ?? "";
+        }
+        catch (Exception ex)
+        {
+            return $"(snímek se nepodařilo pořídit: {ex.Message})";
         }
     }
 
