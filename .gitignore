@@ -1,0 +1,14 @@
+# Build outputs
+bin/
+obj/
+artifacts/
+src/GPhotosSync.Installer/payload.zip
+_migrace_chatu/
+
+# IDE & OS files
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
