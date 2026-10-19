@@ -30,6 +30,7 @@ public class SetupWizardForm : Form
         _db = db;
 
         Text = "Průvodce nastavením – Google Photos Sync";
+        Icon = IconGenerator.AppIcon;
         Width = 680;
         Height = 650;
         FormBorderStyle = FormBorderStyle.FixedDialog;

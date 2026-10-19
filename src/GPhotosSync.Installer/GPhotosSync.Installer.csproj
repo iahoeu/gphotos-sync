@@ -10,6 +10,7 @@
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
     <ForceDesignerDpiUnaware>true</ForceDesignerDpiUnaware>
     <AssemblyName>GPhotosSync_Setup</AssemblyName>
+    <ApplicationIcon>..\GPhotosSync\app.ico</ApplicationIcon>
     <RootNamespace>GPhotosSync.Installer</RootNamespace>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>

@@ -23,9 +23,9 @@ public class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _updateMenuItem;
     private readonly System.Windows.Forms.Timer _updateCheckTimer;
 
-    private readonly Icon _iconIdle;
-    private readonly Icon _iconSyncing;
-    private readonly Icon _iconWarn;
+    private readonly Icon _iconOk;        // zelená: vše v pořádku
+    private readonly Icon _iconAttention; // modrá: čeká se na rozhodnutí uživatele
+    private readonly Icon _iconError;     // červená: chyba
 
     private SettingsForm? _openSettingsForm;
 
@@ -38,9 +38,9 @@ public class TrayApplicationContext : ApplicationContext
         _syncEngine = new SyncEngine(_config, _db, _photosEngine);
         _updateService = new UpdateService(_config);
 
-        _iconIdle = IconGenerator.CreateTrayIcon(Color.FromArgb(40, 185, 85));    // Green badge
-        _iconSyncing = IconGenerator.CreateTrayIcon(Color.FromArgb(30, 140, 255)); // Blue badge
-        _iconWarn = IconGenerator.CreateTrayIcon(Color.FromArgb(235, 115, 25));    // Orange badge
+        _iconOk = IconGenerator.CreateStatusIcon(IconGenerator.Green);
+        _iconAttention = IconGenerator.CreateStatusIcon(IconGenerator.Blue);
+        _iconError = IconGenerator.CreateStatusIcon(IconGenerator.Red);
 
         _statusMenuItem = new ToolStripMenuItem("Stav: Spouštím...") { Enabled = false };
 
@@ -163,7 +163,7 @@ public class TrayApplicationContext : ApplicationContext
 
         _trayIcon = new NotifyIcon
         {
-            Icon = hasInitialBlockedBatch ? _iconWarn : _iconIdle,
+            Icon = hasInitialBlockedBatch ? _iconAttention : _iconOk,
             Text = "Google Photos Sync – Běží na pozadí",
             ContextMenuStrip = menu,
             Visible = true
@@ -359,17 +359,18 @@ public class TrayApplicationContext : ApplicationContext
             _approveBulkDeleteMenuItem.Text = $"⚠️ Potvrdit smazání {e.PendingBulkDeleteCount} položek v Google Photos";
         }
 
-        if (e.RequiresLogin || e.HasError || hasPendingBulkDelete || e.IsDeletePausedDueToUnverifiedAccount)
+        // Modrá = čeká se na uživatele (má přednost, i když stav nese příznak chyby), červená = chyba, jinak zelená
+        if (hasPendingBulkDelete || e.RequiresLogin || e.IsDeletePausedDueToUnverifiedAccount)
         {
-            _trayIcon.Icon = _iconWarn;
+            _trayIcon.Icon = _iconAttention;
         }
-        else if (e.IsSyncing)
+        else if (e.HasError)
         {
-            _trayIcon.Icon = _iconSyncing;
+            _trayIcon.Icon = _iconError;
         }
         else
         {
-            _trayIcon.Icon = _iconIdle;
+            _trayIcon.Icon = _iconOk;
         }
     }
 

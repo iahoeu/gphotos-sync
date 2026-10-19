@@ -153,6 +153,7 @@ internal sealed class OffScreenBrowserForm : Form
     public OffScreenBrowserForm()
     {
         Text = "Google Photos Sync – Prohlížeč na pozadí";
+        Icon = GPhotosSync.Forms.IconGenerator.AppIcon;
         Width = 1280;
         Height = 900;
         ShowInTaskbar = false;

@@ -4,6 +4,7 @@ Automatická synchronizace fotek a videí z **Google Photos** do složky ve Wind
 
 ## Hlavní funkce
 1. **Automatický běh na pozadí (System Tray):** Spouští se po startu Windows a tiše kontroluje nové fotky a videa v Google Photos.
+   - **Barva ikony u hodin:** zelená = vše v pořádku, modrá = aplikace čeká na vaše rozhodnutí (hromadné mazání, potvrzení účtu, přihlášení), červená = chyba (podrobnosti v menu ikony a v protokolu).
 2. **Originální kvalita a zachování EXIF metadat:** Stahuje původní soubory přes nativní jádro Microsoft Edge WebView2 a nastavuje souborům ve Windows reálné datum vyfocení podle EXIF.
 3. **Jedna přehledná složka (jako OneDrive):** Všechny nové fotky a videa padají do jedné zvolené složky.
 4. **Obousměrná synchronizace (Mazání / Přesunutí / Podsložky):**

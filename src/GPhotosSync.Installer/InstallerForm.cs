@@ -38,6 +38,7 @@ public class InstallerForm : Form
     public InstallerForm()
     {
         Text = "Instalace – Google Photos Sync pro Windows (v1.0)";
+        try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath ?? Application.ExecutablePath); } catch { }
         Width = 640;
         Height = 510;
         FormBorderStyle = FormBorderStyle.FixedDialog;

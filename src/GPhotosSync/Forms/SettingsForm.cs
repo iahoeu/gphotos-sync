@@ -38,6 +38,7 @@ public class SettingsForm : Form
 
         var ver = UpdateService.GetCurrentVersion();
         Text = $"Nastavení a stav – Google Photos Sync (v{ver.Major}.{ver.Minor}.{Math.Max(0, ver.Build)})";
+        Icon = IconGenerator.AppIcon;
         Width = 680;
         Height = 760;
         FormBorderStyle = FormBorderStyle.FixedDialog;

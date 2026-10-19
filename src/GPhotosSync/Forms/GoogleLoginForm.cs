@@ -21,6 +21,7 @@ public class GoogleLoginForm : Form
         _photosEngine.ClearConfirmedSessionAccountEmail();
 
         Text = "Přihlášení k účtu Google Photos";
+        Icon = IconGenerator.AppIcon;
         Width = 980;
         Height = 760;
         StartPosition = FormStartPosition.CenterScreen;
