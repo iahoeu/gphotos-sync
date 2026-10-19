@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -14,6 +15,26 @@ public class DiscoveredMediaItem
     public string AriaLabel { get; set; } = string.Empty;
     public bool IsVideo { get; set; }
     public DateTime? EstimatedDate { get; set; }
+    public bool DiscoveredFromRecentlyAdded { get; set; }
+}
+
+public class TimelineScanResult
+{
+    public bool Success { get; set; }
+    public string? ErrorMessage { get; set; }
+    public List<DiscoveredMediaItem> Items { get; set; } = [];
+    public bool ReachedTargetBoundary { get; set; } = false;
+    public string? LastScannedMediaKey { get; set; }
+    public DateTime? OldestScannedDate { get; set; }
+}
+
+public class AccountCheckResult
+{
+    public bool IsLoggedIn { get; set; }
+    public bool IsAccountVerifiedForDelete { get; set; }
+    public string? DetectedEmail { get; set; }
+    public string? ErrorMessage { get; set; }
+    public string? DeleteBlockedReason { get; set; }
 }
 
 public class DownloadResult
@@ -22,6 +43,7 @@ public class DownloadResult
     public bool SkippedVideo { get; set; }
     public string LocalFileName { get; set; } = string.Empty;
     public string FullPath { get; set; } = string.Empty;
+    public string FileHash { get; set; } = string.Empty;
     public long FileSize { get; set; }
     public DateTime? TakenAt { get; set; }
     public string? ErrorMessage { get; set; }
@@ -118,6 +140,28 @@ public class GooglePhotosEngine : IDisposable
     private readonly SemaphoreSlim _operationLock = new(1, 1);
     private bool _isInitialized;
     private bool _isKnownLoggedIn;
+    private string? _lastVerifiedEmail;
+    private string? _manuallyConfirmedSessionEmail;
+
+    public string? LastVerifiedEmail => _lastVerifiedEmail;
+
+    /// <summary>
+    /// Bod 8 (Doplněk): Uloží ruční potvrzení e-mailu účtu Google uživatelem pro aktuální přihlášenou relaci,
+    /// pokud Google Photos e-mail v DOMu přímo nevystavuje. Při odhlášení nebo změně relace se automaticky ruší.
+    /// </summary>
+    public void ConfirmCurrentSessionAccountEmail(string confirmedEmail)
+    {
+        if (!string.IsNullOrWhiteSpace(confirmedEmail))
+        {
+            _manuallyConfirmedSessionEmail = confirmedEmail.Trim();
+            _lastVerifiedEmail = _manuallyConfirmedSessionEmail;
+        }
+    }
+
+    public void ClearConfirmedSessionAccountEmail()
+    {
+        _manuallyConfirmedSessionEmail = null;
+    }
 
     private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -126,24 +170,42 @@ public class GooglePhotosEngine : IDisposable
 
     private static readonly Dictionary<string, int> CzechMonths = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["leden"] = 1, ["ledna"] = 1, ["led"] = 1,
-        ["únor"] = 2, ["února"] = 2, ["unor"] = 2, ["unora"] = 2, ["úno"] = 2,
-        ["březen"] = 3, ["března"] = 3, ["brezen"] = 3, ["brezna"] = 3, ["bře"] = 3,
-        ["duben"] = 4, ["dubna"] = 4, ["dub"] = 4,
-        ["květen"] = 5, ["května"] = 5, ["kveten"] = 5, ["kvetna"] = 5, ["kvě"] = 5,
-        ["červen"] = 6, ["června"] = 6, ["cerven"] = 6, ["cervna"] = 6, ["čvn"] = 6,
-        ["červenec"] = 7, ["července"] = 7, ["cervenec"] = 7, ["cervence"] = 7, ["čvc"] = 7,
-        ["srpen"] = 8, ["srpna"] = 8, ["srp"] = 8,
-        ["září"] = 9, ["zari"] = 9, ["zář"] = 9,
-        ["říjen"] = 10, ["října"] = 10, ["rijen"] = 10, ["rijna"] = 10, ["říj"] = 10,
-        ["listopad"] = 11, ["listopadu"] = 11, ["lis"] = 11,
-        ["prosinec"] = 12, ["prosince"] = 12, ["pro"] = 12
+        ["leden"] = 1, ["ledna"] = 1, ["led"] = 1, ["jan"] = 1, ["january"] = 1,
+        ["únor"] = 2, ["února"] = 2, ["unor"] = 2, ["unora"] = 2, ["úno"] = 2, ["feb"] = 2, ["february"] = 2,
+        ["březen"] = 3, ["března"] = 3, ["brezen"] = 3, ["brezna"] = 3, ["bře"] = 3, ["mar"] = 3, ["march"] = 3,
+        ["duben"] = 4, ["dubna"] = 4, ["dub"] = 4, ["apr"] = 4, ["april"] = 4,
+        ["květen"] = 5, ["května"] = 5, ["kveten"] = 5, ["kvetna"] = 5, ["kvě"] = 5, ["may"] = 5,
+        ["červen"] = 6, ["června"] = 6, ["cerven"] = 6, ["cervna"] = 6, ["čvn"] = 6, ["jun"] = 6, ["june"] = 6,
+        ["červenec"] = 7, ["července"] = 7, ["cervenec"] = 7, ["cervence"] = 7, ["čvc"] = 7, ["jul"] = 7, ["july"] = 7,
+        ["srpen"] = 8, ["srpna"] = 8, ["srp"] = 8, ["aug"] = 8, ["august"] = 8,
+        ["září"] = 9, ["zari"] = 9, ["zář"] = 9, ["sep"] = 9, ["sept"] = 9, ["september"] = 9,
+        ["říjen"] = 10, ["října"] = 10, ["rijen"] = 10, ["rijna"] = 10, ["říj"] = 10, ["oct"] = 10, ["october"] = 10,
+        ["listopad"] = 11, ["listopadu"] = 11, ["lis"] = 11, ["nov"] = 11, ["november"] = 11,
+        ["prosinec"] = 12, ["prosince"] = 12, ["pro"] = 12, ["dec"] = 12, ["december"] = 12
     };
 
     public bool IsKnownLoggedIn
     {
         get => _isKnownLoggedIn;
         set => _isKnownLoggedIn = value;
+    }
+
+    /// <summary>
+    /// P3-16: Synchronizační objekt UI vlákna pro FileSystemWatcher a časovače.
+    /// </summary>
+    public ISynchronizeInvoke UiSyncObject => _hostForm;
+
+    public void InvokeOnUiThread(Action action)
+    {
+        if (_hostForm.IsDisposed) return;
+        if (_hostForm.InvokeRequired)
+        {
+            try { _hostForm.BeginInvoke(action); } catch { }
+        }
+        else
+        {
+            action();
+        }
     }
 
     public GooglePhotosEngine()
@@ -213,24 +275,51 @@ public class GooglePhotosEngine : IDisposable
         return _env!;
     }
 
-    public async Task<bool> CheckLoggedInAsync()
+    public async Task<bool> CheckLoggedInAsync(string? expectedEmail = null)
+    {
+        var res = await CheckLoginAndAccountAsync(expectedEmail);
+        return res.IsLoggedIn;
+    }
+
+    /// <summary>
+    /// P1-8 & Bod 8 (Doplněk): Přísná kontrola přihlášení a shody Google účtu.
+    /// - Při výjimce nebo neprůkazném výsledku VŽDY vrací IsLoggedIn = false.
+    /// - Mazání (IsAccountVerifiedForDelete) je povolené VÝHRADNĚ tehdy, když je vyplněn ExpectedGoogleAccountEmail
+    ///   a podařilo se jej ověřit ze stránky (nebo jej uživatel pro tuto aktivní relaci výslovně potvrdil).
+    /// </summary>
+    public async Task<AccountCheckResult> CheckLoginAndAccountAsync(string? expectedEmail = null)
     {
         await _operationLock.WaitAsync();
         try
         {
             await EnsureInitializedAsync();
-            await NavigateAndWaitForDomAsync("https://photos.google.com/", 12000);
+            bool navOk = await NavigateAndWaitForDomAsync("https://photos.google.com/", 12000);
+            if (!navOk)
+            {
+                _isKnownLoggedIn = false;
+                _manuallyConfirmedSessionEmail = null;
+                return new AccountCheckResult
+                {
+                    IsLoggedIn = false,
+                    IsAccountVerifiedForDelete = false,
+                    ErrorMessage = "Nepodařilo se načíst stránku Google Photos (navigace selhala nebo vypršel časový limit)."
+                };
+            }
 
             for (int attempt = 0; attempt < 6; attempt++)
             {
                 await Task.Delay(700);
                 var url = _webView.CoreWebView2.Source ?? "";
-                if (url.Contains("accounts.google.com", StringComparison.OrdinalIgnoreCase) ||
-                    url.Contains("/about", StringComparison.OrdinalIgnoreCase) ||
-                    url.Contains("workspace.google.com", StringComparison.OrdinalIgnoreCase))
+                if (IsLoginOrMarketingUrl(url))
                 {
                     _isKnownLoggedIn = false;
-                    return false;
+                    _manuallyConfirmedSessionEmail = null;
+                    return new AccountCheckResult
+                    {
+                        IsLoggedIn = false,
+                        IsAccountVerifiedForDelete = false,
+                        ErrorMessage = "Uživatel není přihlášen ke Google Photos."
+                    };
                 }
 
                 var checkJs = @"
@@ -239,29 +328,144 @@ public class GooglePhotosEngine : IDisposable
                         const hasAppShell = document.querySelector('c-wiz') !== null &&
                                             (document.querySelector('input[aria-label]') !== null ||
                                              document.querySelector('a[aria-label*=""Google""]') !== null ||
+                                             document.querySelector('button[aria-label*=""Google""]') !== null ||
                                              document.querySelector('img[src*=""googleusercontent""]') !== null ||
                                              document.querySelector('[role=""main""]') !== null);
                         const hasSignInBtn = Array.from(document.querySelectorAll('a, button'))
                             .some(el => /^(Přihlásit se|Sign in|Přejít do Fotek Google|Go to Google Photos)$/i.test((el.innerText || '').trim()));
-                        if (hasSignInBtn && !hasPhotos) return false;
-                        return hasPhotos || hasAppShell;
+                        if (hasSignInBtn && !hasPhotos) {
+                            return JSON.stringify({ loggedIn: false, email: '' });
+                        }
+
+                        let email = '';
+                        const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
+                        const accountEls = Array.from(document.querySelectorAll('a[aria-label*=""@""], button[aria-label*=""@""], div[aria-label*=""@""], [data-email]'));
+                        for (const el of accountEls) {
+                            const dataEmail = el.getAttribute('data-email') || '';
+                            if (emailRegex.test(dataEmail)) {
+                                email = dataEmail.match(emailRegex)[1];
+                                break;
+                            }
+                            const aria = el.getAttribute('aria-label') || '';
+                            const m = aria.match(emailRegex);
+                            if (m) {
+                                email = m[1];
+                                break;
+                            }
+                        }
+
+                        if (!email) {
+                            const scripts = Array.from(document.querySelectorAll('script'));
+                            for (const s of scripts) {
+                                const txt = s.textContent || '';
+                                if (txt.includes('WIZ_global_data') || txt.includes('AF_initDataCallback')) {
+                                    const m = txt.match(/""([a-zA-Z0-9._%+-]+@(?:gmail\.com|googlemail\.com|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))""/);
+                                    if (m) {
+                                        email = m[1];
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        return JSON.stringify({
+                            loggedIn: !!(hasPhotos || hasAppShell),
+                            email: email || ''
+                        });
                     })();
                 ";
 
-                var result = await _webView.CoreWebView2.ExecuteScriptAsync(checkJs);
-                if (result == "true")
+                var rawJson = await _webView.CoreWebView2.ExecuteScriptAsync(checkJs);
+                if (!string.IsNullOrWhiteSpace(rawJson) && rawJson != "null")
                 {
-                    _isKnownLoggedIn = true;
-                    return true;
+                    var innerJson = JsonSerializer.Deserialize<string>(rawJson);
+                    if (!string.IsNullOrWhiteSpace(innerJson))
+                    {
+                        using var doc = JsonDocument.Parse(innerJson);
+                        bool isLogged = doc.RootElement.GetProperty("loggedIn").GetBoolean();
+                        string email = doc.RootElement.TryGetProperty("email", out var em) ? (em.GetString() ?? "").Trim() : "";
+
+                        if (isLogged)
+                        {
+                            var cleanExpected = expectedEmail?.Trim() ?? "";
+
+                            if (!string.IsNullOrWhiteSpace(email))
+                            {
+                                _lastVerifiedEmail = email;
+
+                                if (!string.IsNullOrWhiteSpace(cleanExpected) &&
+                                    !string.Equals(cleanExpected, email, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    _isKnownLoggedIn = false;
+                                    _manuallyConfirmedSessionEmail = null;
+                                    var mismatchMsg = $"Přihlášený účet Google ({email}) neodpovídá dříve nastavenému účtu ({cleanExpected}). Synchronizace a mazání byly zastaveny.";
+                                    Logger.Error(mismatchMsg);
+                                    return new AccountCheckResult
+                                    {
+                                        IsLoggedIn = false,
+                                        IsAccountVerifiedForDelete = false,
+                                        DetectedEmail = email,
+                                        ErrorMessage = mismatchMsg
+                                    };
+                                }
+
+                                _isKnownLoggedIn = true;
+                                bool verifiedForDelete = !string.IsNullOrWhiteSpace(cleanExpected) &&
+                                                         string.Equals(cleanExpected, email, StringComparison.OrdinalIgnoreCase);
+
+                                return new AccountCheckResult
+                                {
+                                    IsLoggedIn = true,
+                                    IsAccountVerifiedForDelete = verifiedForDelete,
+                                    DetectedEmail = email,
+                                    DeleteBlockedReason = verifiedForDelete ? null : "E-mail účtu Google zatím nebyl uložen v konfiguraci."
+                                };
+                            }
+
+                            // E-mail se ze stránky nepodařilo vyčíst (Bod 8 + Doplněk):
+                            _isKnownLoggedIn = true;
+
+                            bool isManuallyConfirmedForExpected =
+                                !string.IsNullOrWhiteSpace(cleanExpected) &&
+                                !string.IsNullOrWhiteSpace(_manuallyConfirmedSessionEmail) &&
+                                string.Equals(cleanExpected, _manuallyConfirmedSessionEmail, StringComparison.OrdinalIgnoreCase);
+
+                            return new AccountCheckResult
+                            {
+                                IsLoggedIn = true,
+                                IsAccountVerifiedForDelete = isManuallyConfirmedForExpected,
+                                DetectedEmail = isManuallyConfirmedForExpected ? cleanExpected : null,
+                                DeleteBlockedReason = isManuallyConfirmedForExpected
+                                    ? null
+                                    : string.IsNullOrWhiteSpace(cleanExpected)
+                                        ? "Mazání v cloudu je vypnuté: není nastaven a potvrzen e-mail účtu Google (potvrďte účet v menu u ikony v liště)."
+                                        : $"Mazání v cloudu je pozastaveno: ze stránky Google Photos se nepodařilo automaticky ověřit e-mail účtu '{cleanExpected}'. Potvrďte účet v menu u ikony v liště."
+                            };
+                        }
+                    }
                 }
             }
 
-            return _isKnownLoggedIn;
+            _isKnownLoggedIn = false;
+            _manuallyConfirmedSessionEmail = null;
+            return new AccountCheckResult
+            {
+                IsLoggedIn = false,
+                IsAccountVerifiedForDelete = false,
+                ErrorMessage = "Nepodařilo se průkazně ověřit přihlášení ke Google Photos."
+            };
         }
         catch (Exception ex)
         {
             Logger.Warn($"Kontrola přihlášení selhala: {ex.Message}");
-            return _isKnownLoggedIn;
+            _isKnownLoggedIn = false;
+            _manuallyConfirmedSessionEmail = null;
+            return new AccountCheckResult
+            {
+                IsLoggedIn = false,
+                IsAccountVerifiedForDelete = false,
+                ErrorMessage = $"Chyba při ověřování přihlášení: {ex.Message}"
+            };
         }
         finally
         {
@@ -269,7 +473,178 @@ public class GooglePhotosEngine : IDisposable
         }
     }
 
-    public async Task<List<DiscoveredMediaItem>> ScanTimelineAsync(int maxScrollSteps = 5, CancellationToken ct = default)
+    private static bool IsLoginOrMarketingUrl(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return true;
+        return url.Contains("accounts.google.com", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("/about", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("/signin", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("/ServiceLogin", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("workspace.google.com", StringComparison.OrdinalIgnoreCase) ||
+               !url.StartsWith("https://photos.google.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Bod 10b (Doplněk): Skenuje pohled „Nedávno přidané“ (https://photos.google.com/search/_tra_),
+    /// který řadí položky podle data nahrání do Google Photos (nikoliv podle EXIF data pořízení),
+    /// takže spolehlivě zachytí i nově nahrané fotky se starým datem pořízení.
+    /// </summary>
+    public async Task<TimelineScanResult> ScanRecentlyAddedAsync(
+        Func<string, bool> isAlreadyKnownMediaKey,
+        int maxScrollStepsLimit = 15,
+        CancellationToken ct = default)
+    {
+        await _operationLock.WaitAsync(ct);
+        try
+        {
+            await EnsureInitializedAsync();
+            const string recentlyAddedUrl = "https://photos.google.com/search/_tra_";
+            Logger.Info($"Kontroluji pohled 'Nedávno přidané' ({recentlyAddedUrl})...");
+
+            bool navOk = await NavigateAndWaitForDomAsync(recentlyAddedUrl, 15000);
+            if (!navOk)
+            {
+                return new TimelineScanResult
+                {
+                    Success = false,
+                    ReachedTargetBoundary = false,
+                    ErrorMessage = "Nepodařilo se načíst pohled 'Nedávno přidané' (_tra_)."
+                };
+            }
+
+            var currentUrl = _webView.CoreWebView2.Source ?? "";
+            if (IsLoginOrMarketingUrl(currentUrl) ||
+                !currentUrl.Contains("/search/_tra_", StringComparison.OrdinalIgnoreCase))
+            {
+                return new TimelineScanResult
+                {
+                    Success = false,
+                    ReachedTargetBoundary = false,
+                    ErrorMessage = $"Adresa pohledu 'Nedávno přidané' nebyla ověřena (aktuální URL: {currentUrl})."
+                };
+            }
+
+            await WakeUpVirtualizedGridAsync();
+
+            int domAnchorCount = await WaitForPhotoAnchorsAsync(maxWaitSteps: 10, ct);
+            if (domAnchorCount == 0)
+            {
+                return new TimelineScanResult
+                {
+                    Success = false,
+                    ReachedTargetBoundary = false,
+                    ErrorMessage = "Pohled 'Nedávno přidané' (_tra_) neobsahuje žádné odkazy na fotky."
+                };
+            }
+
+            var itemsById = new Dictionary<string, DiscoveredMediaItem>(StringComparer.Ordinal);
+            int consecutiveStepsAllKnown = 0;
+            int consecutiveStepsNoNew = 0;
+            bool reachedBoundary = false;
+            string? lastKey = null;
+
+            for (int step = 0; step < maxScrollStepsLimit; step++)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var extracted = await ExtractPhotoAnchorsFromDomAsync();
+                int newlyAddedInStep = 0;
+                int unseenInStep = 0;
+
+                foreach (var (key, label, dateHint, isVid) in extracted)
+                {
+                    if (string.IsNullOrEmpty(key) || itemsById.ContainsKey(key))
+                        continue;
+
+                    var estimatedDate = ParseDateFromAriaLabel(label) ?? ParseDateFromAriaLabel(dateHint);
+                    itemsById[key] = new DiscoveredMediaItem
+                    {
+                        MediaKey = key,
+                        PhotoUrl = $"https://photos.google.com/photo/{key}",
+                        AriaLabel = !string.IsNullOrWhiteSpace(label) ? label : dateHint,
+                        IsVideo = isVid,
+                        EstimatedDate = estimatedDate,
+                        DiscoveredFromRecentlyAdded = true
+                    };
+                    lastKey = key;
+                    newlyAddedInStep++;
+
+                    if (!isAlreadyKnownMediaKey(key))
+                    {
+                        unseenInStep++;
+                    }
+                }
+
+                if (newlyAddedInStep == 0)
+                {
+                    consecutiveStepsNoNew++;
+                }
+                else
+                {
+                    consecutiveStepsNoNew = 0;
+                    if (unseenInStep == 0)
+                        consecutiveStepsAllKnown++;
+                    else
+                        consecutiveStepsAllKnown = 0;
+                }
+
+                if (step + 1 >= 2 && consecutiveStepsAllKnown >= 2)
+                {
+                    reachedBoundary = true;
+                    break;
+                }
+
+                if (step + 1 >= 3 && consecutiveStepsNoNew >= 4)
+                {
+                    reachedBoundary = await VerifyTrueEndOfTimelineAsync(ct);
+                    break;
+                }
+
+                if (step < maxScrollStepsLimit - 1)
+                {
+                    await ScrollTimelineStepAsync(ct);
+                }
+            }
+
+            return new TimelineScanResult
+            {
+                Success = true,
+                Items = itemsById.Values.ToList(),
+                ReachedTargetBoundary = reachedBoundary,
+                LastScannedMediaKey = lastKey
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Skenování pohledu 'Nedávno přidané' selhalo: {ex.Message}");
+            return new TimelineScanResult
+            {
+                Success = false,
+                ReachedTargetBoundary = false,
+                ErrorMessage = ex.Message
+            };
+        }
+        finally
+        {
+            _operationLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// P1-7, P1-9 & Bod 10: Skenuje časovou osu Google Photos, rozlišuje selhání skenu od prázdné knihovny,
+    /// umí navázat na předchozí nedokončený sken (resumeAfterMediaKey) a konec knihovny ověřuje v DOMu.
+    /// </summary>
+    public async Task<TimelineScanResult> ScanTimelineAsync(
+        Func<string, bool>? isAlreadyKnownMediaKey = null,
+        DateTime? cutoffDate = null,
+        bool scanAllHistory = false,
+        int maxScrollStepsLimit = 60,
+        string? resumeAfterMediaKey = null,
+        CancellationToken ct = default)
     {
         await _operationLock.WaitAsync(ct);
         try
@@ -278,204 +653,192 @@ public class GooglePhotosEngine : IDisposable
             var itemsById = new Dictionary<string, DiscoveredMediaItem>(StringComparer.Ordinal);
 
             Logger.Info("Otevírám časovou osu Google Photos (https://photos.google.com/)...");
-            await NavigateAndWaitForDomAsync("https://photos.google.com/", 18000);
-
-            // Trigger resize & scroll wakeup so Google Photos virtualized grid mounts items immediately
-            await _webView.CoreWebView2.ExecuteScriptAsync(@"
-                (() => {
-                    window.dispatchEvent(new Event('resize'));
-                    window.dispatchEvent(new Event('focus'));
-                    document.dispatchEvent(new Event('visibilitychange'));
-                })();
-            ");
-
-            // Wait up to 10 seconds for timeline photo elements to mount in the DOM
-            int domAnchorCount = 0;
-            for (int wait = 0; wait < 15; wait++)
+            bool navOk = await NavigateAndWaitForDomAsync("https://photos.google.com/", 18000);
+            if (!navOk)
             {
-                ct.ThrowIfCancellationRequested();
-                await Task.Delay(600, ct);
-
-                var countJson = await _webView.CoreWebView2.ExecuteScriptAsync(@"
-                    (() => {
-                        return document.querySelectorAll('a[href*=""/photo/""], a[href*=""photo/""]').length;
-                    })();
-                ");
-
-                if (int.TryParse(countJson, out domAnchorCount) && domAnchorCount > 0)
+                return new TimelineScanResult
                 {
-                    break;
-                }
-
-                // Nudge scroll slightly to wake up IntersectionObserver if needed
-                if (wait == 4 || wait == 8)
-                {
-                    await _webView.CoreWebView2.ExecuteScriptAsync("window.scrollBy(0, 120); window.scrollBy(0, -120);");
-                }
+                    Success = false,
+                    ReachedTargetBoundary = false,
+                    ErrorMessage = "Nepodařilo se načíst časovou osu Google Photos (navigace selhala nebo vypršel čas)."
+                };
             }
 
             var currentUrl = _webView.CoreWebView2.Source ?? "";
+            if (IsLoginOrMarketingUrl(currentUrl))
+            {
+                _isKnownLoggedIn = false;
+                _manuallyConfirmedSessionEmail = null;
+                return new TimelineScanResult
+                {
+                    Success = false,
+                    ReachedTargetBoundary = false,
+                    ErrorMessage = "Přihlášení ke Google Photos vypršelo."
+                };
+            }
+
+            await WakeUpVirtualizedGridAsync();
+
+            int domAnchorCount = await WaitForPhotoAnchorsAsync(maxWaitSteps: 15, ct);
+            currentUrl = _webView.CoreWebView2.Source ?? "";
             Logger.Info($"Stránka Google Photos načtena ({currentUrl}), počáteční počet DOM odkazů: {domAnchorCount}.");
 
-            for (int step = 0; step < maxScrollSteps; step++)
+            if (domAnchorCount == 0)
+            {
+                // P1-7: Rozlišit prázdnou knihovnu od selhání načtení DOM
+                var emptyLibraryCheck = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                    (() => {
+                        const txt = document.body ? (document.body.innerText || '') : '';
+                        const hasShell = document.querySelector('c-wiz') !== null && document.querySelector('[role=""main""]') !== null;
+                        const isExplicitEmpty = /Žádné fotky|Zatím žádné fotky|No photos|Ready to add some photos/i.test(txt);
+                        return hasShell && isExplicitEmpty;
+                    })();
+                ");
+
+                if (emptyLibraryCheck == "true")
+                {
+                    Logger.Info("Knihovna Google Photos je prázdná (ověřeno).");
+                    return new TimelineScanResult
+                    {
+                        Success = true,
+                        Items = [],
+                        ReachedTargetBoundary = true
+                    };
+                }
+
+                return new TimelineScanResult
+                {
+                    Success = false,
+                    ReachedTargetBoundary = false,
+                    ErrorMessage = "Časová osa Google Photos se nevykreslila (0 nalezených fotek a nejde o prázdnou knihovnu)."
+                };
+            }
+
+            int consecutiveStepsWithoutNewItems = 0;
+            int consecutiveStepsAllKnownOrOlder = 0;
+            bool reachedBoundary = false;
+            bool passedResumeKey = string.IsNullOrWhiteSpace(resumeAfterMediaKey);
+            int minStepsBeforeEarlyStop = scanAllHistory ? 10 : 3;
+            string? lastScannedKey = null;
+            DateTime? oldestScannedDate = null;
+
+            for (int step = 0; step < maxScrollStepsLimit; step++)
             {
                 ct.ThrowIfCancellationRequested();
 
-                // Extract from both rendered DOM anchors (including Shadow DOM / c-wiz) AND AF_initDataCallback scripts
-                var extractScript = @"
-                    (() => {
-                        const results = [];
-                        const seen = new Set();
+                var extracted = await ExtractPhotoAnchorsFromDomAsync();
+                int newlyAddedInStep = 0;
+                int newUnseenCandidateCountInStep = 0;
 
-                        function addEntry(hrefOrKey, label, isVid, dateHint) {
-                            let key = '';
-                            const idx = hrefOrKey.indexOf('/photo/');
-                            if (idx >= 0) {
-                                key = hrefOrKey.substring(idx + 7).split(/[?#/]/)[0].trim();
-                            } else if (/^AF1Qip[A-Za-z0-9_-]{20,}$/.test(hrefOrKey)) {
-                                key = hrefOrKey;
-                            }
-                            if (!key || key.length < 15 || seen.has(key)) return;
-                            seen.add(key);
-                            results.push({
-                                key: key,
-                                label: label || '',
-                                isVid: !!isVid,
-                                dateHint: dateHint || ''
-                            });
-                        }
-
-                        // 1. Collect all <a> elements containing /photo/ (including shadow roots)
-                        function queryAllDeep(root) {
-                            const anchors = root.querySelectorAll ? Array.from(root.querySelectorAll('a[href*=""photo/""]')) : [];
-                            for (const a of anchors) {
-                                const href = a.getAttribute('href') || a.href || '';
-                                // Ignore album or trash sub-links if they aren't direct timeline photos, except /photo/
-                                if (href.includes('/album/') && !href.includes('/photo/')) continue;
-
-                                let label = a.getAttribute('aria-label') || '';
-                                if (!label) {
-                                    const img = a.querySelector('img[alt], [aria-label]');
-                                    if (img) label = img.getAttribute('aria-label') || img.getAttribute('alt') || '';
-                                }
-
-                                // Find nearest section date header (e.g. 'Dnes', 'Včera', 'so 17. 10.')
-                                let dateHint = '';
-                                let parent = a.parentElement;
-                                for (let depth = 0; depth < 7 && parent; depth++) {
-                                    const prev = parent.previousElementSibling;
-                                    if (prev) {
-                                        const hTxt = (prev.innerText || '').trim().split('\n')[0];
-                                        if (hTxt && hTxt.length < 40) {
-                                            dateHint = hTxt;
-                                            break;
-                                        }
-                                    }
-                                    parent = parent.parentElement;
-                                }
-
-                                const isVid = /video|videa|přehrát|play/i.test(label) ||
-                                              a.querySelector('[aria-label*=""Video""], [aria-label*=""video""], [data-is-video=""true""]') !== null;
-
-                                addEntry(href, label, isVid, dateHint);
-                            }
-
-                            const allEls = root.querySelectorAll ? root.querySelectorAll('*') : [];
-                            for (const el of allEls) {
-                                if (el.shadowRoot) {
-                                    queryAllDeep(el.shadowRoot);
-                                }
-                            }
-                        }
-
-                        queryAllDeep(document);
-
-                        // 2. Fallback: parse AF_initDataCallback script blocks if DOM virtualization hid any items
-                        if (results.length === 0) {
-                            const scripts = Array.from(document.querySelectorAll('script'));
-                            const keyRegex = /""(AF1Qip[A-Za-z0-9_-]{22,80})""/g;
-                            for (const s of scripts) {
-                                const txt = s.textContent || '';
-                                if (!txt.includes('AF1Qip')) continue;
-                                let m;
-                                while ((m = keyRegex.exec(txt)) !== null) {
-                                    addEntry(m[1], '', false, '');
-                                }
-                            }
-                        }
-
-                        return JSON.stringify(results);
-                    })();
-                ";
-
-                var rawJson = await _webView.CoreWebView2.ExecuteScriptAsync(extractScript);
-                if (!string.IsNullOrWhiteSpace(rawJson) && rawJson != "null")
+                foreach (var (key, label, dateHint, isVid) in extracted)
                 {
-                    // ExecuteScriptAsync returns a JSON-encoded string when the script returns JSON.stringify(...)
-                    var innerJson = JsonSerializer.Deserialize<string>(rawJson);
-                    if (!string.IsNullOrWhiteSpace(innerJson))
+                    if (string.IsNullOrEmpty(key))
+                        continue;
+
+                    if (!passedResumeKey && string.Equals(key, resumeAfterMediaKey, StringComparison.Ordinal))
                     {
-                        using var doc = JsonDocument.Parse(innerJson);
-                        if (doc.RootElement.ValueKind == JsonValueKind.Array)
-                        {
-                            foreach (var elem in doc.RootElement.EnumerateArray())
-                            {
-                                var key = elem.GetProperty("key").GetString() ?? "";
-                                var label = elem.GetProperty("label").GetString() ?? "";
-                                var dateHint = elem.TryGetProperty("dateHint", out var dh) ? dh.GetString() ?? "" : "";
-                                var isVid = elem.GetProperty("isVid").GetBoolean();
+                        passedResumeKey = true;
+                    }
 
-                                if (string.IsNullOrEmpty(key) || itemsById.ContainsKey(key))
-                                    continue;
+                    if (itemsById.ContainsKey(key))
+                        continue;
 
-                                var estimatedDate = ParseDateFromAriaLabel(label) ?? ParseDateFromAriaLabel(dateHint);
+                    var estimatedDate = ParseDateFromAriaLabel(label) ?? ParseDateFromAriaLabel(dateHint);
+                    if (estimatedDate.HasValue && (!oldestScannedDate.HasValue || estimatedDate.Value < oldestScannedDate.Value))
+                    {
+                        oldestScannedDate = estimatedDate.Value;
+                    }
 
-                                itemsById[key] = new DiscoveredMediaItem
-                                {
-                                    MediaKey = key,
-                                    PhotoUrl = $"https://photos.google.com/photo/{key}",
-                                    AriaLabel = !string.IsNullOrWhiteSpace(label) ? label : dateHint,
-                                    IsVideo = isVid,
-                                    EstimatedDate = estimatedDate
-                                };
-                            }
-                        }
+                    itemsById[key] = new DiscoveredMediaItem
+                    {
+                        MediaKey = key,
+                        PhotoUrl = $"https://photos.google.com/photo/{key}",
+                        AriaLabel = !string.IsNullOrWhiteSpace(label) ? label : dateHint,
+                        IsVideo = isVid,
+                        EstimatedDate = estimatedDate
+                    };
+
+                    lastScannedKey = key;
+                    newlyAddedInStep++;
+
+                    bool isAlreadyKnown = isAlreadyKnownMediaKey != null && isAlreadyKnownMediaKey(key);
+                    bool isOlderThanCutoff = cutoffDate.HasValue &&
+                                             estimatedDate.HasValue &&
+                                             estimatedDate.Value.Date < cutoffDate.Value.Date;
+
+                    if (!isAlreadyKnown && !isOlderThanCutoff)
+                    {
+                        newUnseenCandidateCountInStep++;
                     }
                 }
 
-                Logger.Info($"Skenování časové osy (krok {step + 1}/{maxScrollSteps}): doposud nalezeno {itemsById.Count} položek.");
+                Logger.Info($"Skenování časové osy (krok {step + 1}): doposud nalezeno {itemsById.Count} položek (+{newlyAddedInStep} v tomto kroku).");
 
-                if (step < maxScrollSteps - 1)
+                if (newlyAddedInStep == 0)
                 {
-                    // Scroll both window and any scrollable containers + send mouse wheel event
-                    await _webView.CoreWebView2.ExecuteScriptAsync(@"
-                        (() => {
-                            window.scrollBy(0, 1200);
-                            if (document.scrollingElement) document.scrollingElement.scrollTop += 1200;
-                            const all = Array.from(document.querySelectorAll('c-wiz, main, [role=""main""], div'));
-                            for (const el of all) {
-                                if (el.scrollHeight > el.clientHeight + 80 && el.clientHeight > 200) {
-                                    const style = window.getComputedStyle(el);
-                                    if (style.overflowY === 'auto' || style.overflowY === 'scroll' || el.tagName === 'C-WIZ') {
-                                        el.scrollTop += 1200;
-                                    }
-                                }
-                            }
-                        })();
-                    ");
-
-                    try
+                    consecutiveStepsWithoutNewItems++;
+                }
+                else
+                {
+                    consecutiveStepsWithoutNewItems = 0;
+                    if (!scanAllHistory && passedResumeKey && newUnseenCandidateCountInStep == 0)
                     {
-                        await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchMouseEvent",
-                            @"{""type"":""mouseWheel"",""x"":640,""y"":450,""deltaX"":0,""deltaY"":1200}");
+                        consecutiveStepsAllKnownOrOlder++;
                     }
-                    catch { }
+                    else
+                    {
+                        consecutiveStepsAllKnownOrOlder = 0;
+                    }
+                }
 
-                    await Task.Delay(1000, ct);
+                // P1-9: Zastavit posouvání, jakmile jsme v běžném režimu (po překonání případného resume bodu) narazili na souvislou vrstvu již známých/starších položek
+                if (!scanAllHistory && passedResumeKey && step + 1 >= minStepsBeforeEarlyStop && consecutiveStepsAllKnownOrOlder >= 2)
+                {
+                    reachedBoundary = true;
+                    break;
+                }
+
+                // Bod 10: Pokud nepřibývají položky, ověřit skutečný konec knihovny v DOMu (žádný aktivní spinner, scroll na konci, stabilní výška)
+                if (step + 1 >= minStepsBeforeEarlyStop && consecutiveStepsWithoutNewItems >= 4)
+                {
+                    if (await VerifyTrueEndOfTimelineAsync(ct))
+                    {
+                        reachedBoundary = true;
+                        break;
+                    }
+
+                    if (consecutiveStepsWithoutNewItems >= 8)
+                    {
+                        Logger.Warn("Skenování časové osy se zastavilo bez potvrzení konce knihovny (síť nebo DOM stále načítá) – bude pokračovat v dalším cyklu.");
+                        reachedBoundary = false;
+                        break;
+                    }
+                }
+
+                if (step < maxScrollStepsLimit - 1)
+                {
+                    await ScrollTimelineStepAsync(ct);
                 }
             }
 
-            return itemsById.Values.ToList();
+            if (itemsById.Count == 0)
+            {
+                return new TimelineScanResult
+                {
+                    Success = false,
+                    ReachedTargetBoundary = false,
+                    ErrorMessage = "Nepodařilo se přečíst žádné položky z časové osy Google Photos."
+                };
+            }
+
+            return new TimelineScanResult
+            {
+                Success = true,
+                Items = itemsById.Values.ToList(),
+                ReachedTargetBoundary = reachedBoundary,
+                LastScannedMediaKey = lastScannedKey,
+                OldestScannedDate = oldestScannedDate
+            };
         }
         catch (OperationCanceledException)
         {
@@ -484,12 +847,279 @@ public class GooglePhotosEngine : IDisposable
         catch (Exception ex)
         {
             Logger.Error($"Chyba při čtení časové osy Google Photos: {ex.Message}");
-            return [];
+            return new TimelineScanResult
+            {
+                Success = false,
+                ReachedTargetBoundary = false,
+                ErrorMessage = ex.Message
+            };
         }
         finally
         {
             _operationLock.Release();
         }
+    }
+
+    private async Task WakeUpVirtualizedGridAsync()
+    {
+        await _webView.CoreWebView2.ExecuteScriptAsync(@"
+            (() => {
+                window.dispatchEvent(new Event('resize'));
+                window.dispatchEvent(new Event('focus'));
+                document.dispatchEvent(new Event('visibilitychange'));
+            })();
+        ");
+    }
+
+    private async Task<int> WaitForPhotoAnchorsAsync(int maxWaitSteps, CancellationToken ct)
+    {
+        int domAnchorCount = 0;
+        for (int wait = 0; wait < maxWaitSteps; wait++)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(600, ct);
+
+            var countJson = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                (() => {
+                    return document.querySelectorAll('a[href*=""/photo/""], a[href*=""photo/""]').length;
+                })();
+            ");
+
+            if (int.TryParse(countJson, out domAnchorCount) && domAnchorCount > 0)
+            {
+                break;
+            }
+
+            if (wait == 4 || wait == 8)
+            {
+                await _webView.CoreWebView2.ExecuteScriptAsync("window.scrollBy(0, 120); window.scrollBy(0, -120);");
+            }
+        }
+        return domAnchorCount;
+    }
+
+    private async Task<List<(string Key, string Label, string DateHint, bool IsVid)>> ExtractPhotoAnchorsFromDomAsync()
+    {
+        var extractScript = @"
+            (() => {
+                const results = [];
+                const seen = new Set();
+
+                function addEntry(hrefOrKey, label, isVid, dateHint) {
+                    let key = '';
+                    const idx = hrefOrKey.indexOf('/photo/');
+                    if (idx >= 0) {
+                        key = hrefOrKey.substring(idx + 7).split(/[?#/]/)[0].trim();
+                    } else if (/^AF1Qip[A-Za-z0-9_-]{20,}$/.test(hrefOrKey)) {
+                        key = hrefOrKey;
+                    }
+                    if (!key || key.length < 15 || seen.has(key)) return;
+                    seen.add(key);
+                    results.push({
+                        key: key,
+                        label: label || '',
+                        isVid: !!isVid,
+                        dateHint: dateHint || ''
+                    });
+                }
+
+                function queryAllDeep(root) {
+                    const anchors = root.querySelectorAll ? Array.from(root.querySelectorAll('a[href*=""photo/""]')) : [];
+                    for (const a of anchors) {
+                        const href = a.getAttribute('href') || a.href || '';
+                        if (href.includes('/album/') && !href.includes('/photo/')) continue;
+
+                        let label = a.getAttribute('aria-label') || '';
+                        if (!label) {
+                            const img = a.querySelector('img[alt], [aria-label]');
+                            if (img) label = img.getAttribute('aria-label') || img.getAttribute('alt') || '';
+                        }
+
+                        let dateHint = '';
+                        let parent = a.parentElement;
+                        for (let depth = 0; depth < 7 && parent; depth++) {
+                            const prev = parent.previousElementSibling;
+                            if (prev) {
+                                const hTxt = (prev.innerText || '').trim().split('\n')[0];
+                                if (hTxt && hTxt.length < 40) {
+                                    dateHint = hTxt;
+                                    break;
+                                }
+                            }
+                            parent = parent.parentElement;
+                        }
+
+                        const isVid = /video|videa|přehrát|play/i.test(label) ||
+                                      a.querySelector('[aria-label*=""Video""], [aria-label*=""video""], [data-is-video=""true""]') !== null;
+
+                        addEntry(href, label, isVid, dateHint);
+                    }
+
+                    const allEls = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                    for (const el of allEls) {
+                        if (el.shadowRoot) {
+                            queryAllDeep(el.shadowRoot);
+                        }
+                    }
+                }
+
+                queryAllDeep(document);
+
+                if (results.length === 0) {
+                    const scripts = Array.from(document.querySelectorAll('script'));
+                    const keyRegex = /""(AF1Qip[A-Za-z0-9_-]{22,80})""/g;
+                    for (const s of scripts) {
+                        const txt = s.textContent || '';
+                        if (!txt.includes('AF1Qip')) continue;
+                        let m;
+                        while ((m = keyRegex.exec(txt)) !== null) {
+                            addEntry(m[1], '', false, '');
+                        }
+                    }
+                }
+
+                return JSON.stringify(results);
+            })();
+        ";
+
+        var list = new List<(string Key, string Label, string DateHint, bool IsVid)>();
+        var rawJson = await _webView.CoreWebView2.ExecuteScriptAsync(extractScript);
+        if (!string.IsNullOrWhiteSpace(rawJson) && rawJson != "null")
+        {
+            var innerJson = JsonSerializer.Deserialize<string>(rawJson);
+            if (!string.IsNullOrWhiteSpace(innerJson))
+            {
+                using var doc = JsonDocument.Parse(innerJson);
+                if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var elem in doc.RootElement.EnumerateArray())
+                    {
+                        var key = elem.GetProperty("key").GetString() ?? "";
+                        var label = elem.GetProperty("label").GetString() ?? "";
+                        var dateHint = elem.TryGetProperty("dateHint", out var dh) ? dh.GetString() ?? "" : "";
+                        var isVid = elem.GetProperty("isVid").GetBoolean();
+                        list.Add((key, label, dateHint, isVid));
+                    }
+                }
+            }
+        }
+        return list;
+    }
+
+    private async Task ScrollTimelineStepAsync(CancellationToken ct)
+    {
+        await _webView.CoreWebView2.ExecuteScriptAsync(@"
+            (() => {
+                window.scrollBy(0, 1200);
+                if (document.scrollingElement) document.scrollingElement.scrollTop += 1200;
+                const all = Array.from(document.querySelectorAll('c-wiz, main, [role=""main""], div'));
+                for (const el of all) {
+                    if (el.scrollHeight > el.clientHeight + 80 && el.clientHeight > 200) {
+                        const style = window.getComputedStyle(el);
+                        if (style.overflowY === 'auto' || style.overflowY === 'scroll' || el.tagName === 'C-WIZ') {
+                            el.scrollTop += 1200;
+                        }
+                    }
+                }
+            })();
+        ");
+
+        try
+        {
+            await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchMouseEvent",
+                @"{""type"":""mouseWheel"",""x"":640,""y"":450,""deltaX"":0,""deltaY"":1200}");
+        }
+        catch { }
+
+        await Task.Delay(1000, ct);
+    }
+
+    /// <summary>
+    /// Bod 10: Ověří v DOMu, že jsme skutečně na konci knihovny (žádný aktivní načítací spinner,
+    /// posuvník hlavního kontejneru dosáhl spodního okraje a po dalším pokusu o posun se scrollHeight nemění).
+    /// </summary>
+    private async Task<bool> VerifyTrueEndOfTimelineAsync(CancellationToken ct)
+    {
+        var currentUrl = _webView.CoreWebView2.Source ?? "";
+        if (IsLoginOrMarketingUrl(currentUrl))
+            return false;
+
+        const string checkStateJs = @"
+            (() => {
+                const spinners = Array.from(document.querySelectorAll('[role=""progressbar""], [aria-busy=""true""]'))
+                    .filter(el => el.offsetParent !== null && el.getBoundingClientRect().height > 0);
+                const hasActiveSpinner = spinners.length > 0;
+
+                let maxScrollHeight = document.scrollingElement ? document.scrollingElement.scrollHeight : 0;
+                let reachedBottom = true;
+
+                const all = Array.from(document.querySelectorAll('c-wiz, main, [role=""main""], div'));
+                for (const el of all) {
+                    if (el.scrollHeight > el.clientHeight + 80 && el.clientHeight > 200) {
+                        const style = window.getComputedStyle(el);
+                        if (style.overflowY === 'auto' || style.overflowY === 'scroll' || el.tagName === 'C-WIZ') {
+                            if (el.scrollHeight > maxScrollHeight) {
+                                maxScrollHeight = el.scrollHeight;
+                            }
+                            if (el.scrollTop + el.clientHeight < el.scrollHeight - 120) {
+                                reachedBottom = false;
+                            }
+                        }
+                    }
+                }
+
+                const anchors = document.querySelectorAll('a[href*=""photo/""]');
+                const lastHref = anchors.length > 0 ? (anchors[anchors.length - 1].getAttribute('href') || '') : '';
+
+                return JSON.stringify({
+                    hasActiveSpinner: hasActiveSpinner,
+                    reachedBottom: reachedBottom,
+                    maxScrollHeight: maxScrollHeight,
+                    lastHref: lastHref
+                });
+            })();
+        ";
+
+        var raw1 = await _webView.CoreWebView2.ExecuteScriptAsync(checkStateJs);
+        if (string.IsNullOrWhiteSpace(raw1) || raw1 == "null")
+            return false;
+
+        var json1 = JsonSerializer.Deserialize<string>(raw1);
+        if (string.IsNullOrWhiteSpace(json1))
+            return false;
+
+        using var doc1 = JsonDocument.Parse(json1);
+        if (doc1.RootElement.GetProperty("hasActiveSpinner").GetBoolean() ||
+            !doc1.RootElement.GetProperty("reachedBottom").GetBoolean())
+        {
+            return false;
+        }
+
+        long height1 = doc1.RootElement.GetProperty("maxScrollHeight").GetInt64();
+        string lastHref1 = doc1.RootElement.GetProperty("lastHref").GetString() ?? "";
+
+        await ScrollTimelineStepAsync(ct);
+        await Task.Delay(500, ct);
+
+        var raw2 = await _webView.CoreWebView2.ExecuteScriptAsync(checkStateJs);
+        if (string.IsNullOrWhiteSpace(raw2) || raw2 == "null")
+            return false;
+
+        var json2 = JsonSerializer.Deserialize<string>(raw2);
+        if (string.IsNullOrWhiteSpace(json2))
+            return false;
+
+        using var doc2 = JsonDocument.Parse(json2);
+        if (doc2.RootElement.GetProperty("hasActiveSpinner").GetBoolean() ||
+            !doc2.RootElement.GetProperty("reachedBottom").GetBoolean())
+        {
+            return false;
+        }
+
+        long height2 = doc2.RootElement.GetProperty("maxScrollHeight").GetInt64();
+        string lastHref2 = doc2.RootElement.GetProperty("lastHref").GetString() ?? "";
+
+        return height2 == height1 && string.Equals(lastHref1, lastHref2, StringComparison.Ordinal);
     }
 
     public async Task<DownloadResult> DownloadMediaAsync(
@@ -499,110 +1129,199 @@ public class GooglePhotosEngine : IDisposable
         CancellationToken ct = default)
     {
         await _operationLock.WaitAsync(ct);
+        CoreWebView2DownloadOperation? activeDownloadOp = null;
+        string? activeTempPath = null;
         try
         {
             await EnsureInitializedAsync();
-            Directory.CreateDirectory(targetFolder);
+
+            if (!Directory.Exists(targetFolder))
+            {
+                return new DownloadResult
+                {
+                    Success = false,
+                    ErrorMessage = $"Cílová složka '{targetFolder}' neexistuje."
+                };
+            }
 
             var tcsDownload = new TaskCompletionSource<DownloadResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-            string? tempFilePath = null;
-            string? originalFileName = null;
+            var downloadSync = new object();
+            bool downloadStarted = false;
 
             void OnDownloadStarting(object? sender, CoreWebView2DownloadStartingEventArgs e)
             {
-                try
+                string thisTempFilePath;
+                string thisOriginalFileName;
+                CoreWebView2DownloadOperation op;
+
+                lock (downloadSync)
                 {
                     e.Handled = true; // Hide default browser download bar
-                    originalFileName = Path.GetFileName(e.ResultFilePath);
-                    if (string.IsNullOrWhiteSpace(originalFileName))
+
+                    // P1-10: Pokud už jedno stahování pro tuto položku běží, všechna další okamžitě zrušíme
+                    if (downloadStarted || tcsDownload.Task.IsCompleted)
                     {
-                        originalFileName = $"{item.MediaKey[..Math.Min(12, item.MediaKey.Length)]}.jpg";
+                        e.Cancel = true;
+                        return;
                     }
 
-                    var ext = Path.GetExtension(originalFileName);
-                    if (!allowVideos && VideoExtensions.Contains(ext))
+                    downloadStarted = true;
+                    op = e.DownloadOperation;
+                    activeDownloadOp = op;
+
+                    thisOriginalFileName = Path.GetFileName(e.ResultFilePath);
+                    if (string.IsNullOrWhiteSpace(thisOriginalFileName))
+                    {
+                        var defaultExt = item.IsVideo ? ".mp4" : ".jpg";
+                        thisOriginalFileName = $"{item.MediaKey[..Math.Min(12, item.MediaKey.Length)]}{defaultExt}";
+                    }
+
+                    var ext = Path.GetExtension(thisOriginalFileName);
+                    if (!allowVideos && (item.IsVideo || VideoExtensions.Contains(ext)))
                     {
                         e.Cancel = true;
                         tcsDownload.TrySetResult(new DownloadResult
                         {
                             Success = false,
                             SkippedVideo = true,
-                            LocalFileName = originalFileName
+                            LocalFileName = thisOriginalFileName
                         });
                         return;
                     }
 
-                    tempFilePath = Path.Combine(targetFolder, $".{Guid.NewGuid():N}_{originalFileName}.part");
-                    e.ResultFilePath = tempFilePath;
+                    thisTempFilePath = Path.Combine(targetFolder, $".{Guid.NewGuid():N}_{thisOriginalFileName}.part");
+                    activeTempPath = thisTempFilePath;
+                    e.ResultFilePath = thisTempFilePath;
+                }
 
-                    var op = e.DownloadOperation;
-                    op.StateChanged += (_, _) =>
+                op.StateChanged += (_, _) =>
+                {
+                    try
                     {
                         if (op.State == CoreWebView2DownloadState.Completed)
                         {
                             tcsDownload.TrySetResult(new DownloadResult
                             {
                                 Success = true,
-                                LocalFileName = originalFileName,
-                                FullPath = tempFilePath
+                                LocalFileName = thisOriginalFileName,
+                                FullPath = thisTempFilePath
                             });
                         }
                         else if (op.State == CoreWebView2DownloadState.Interrupted)
                         {
+                            CleanupTempFile(thisTempFilePath);
                             tcsDownload.TrySetResult(new DownloadResult
                             {
                                 Success = false,
                                 ErrorMessage = $"Stahování přerušeno ({op.InterruptReason})"
                             });
                         }
-                    };
-                }
-                catch (Exception ex)
-                {
-                    tcsDownload.TrySetResult(new DownloadResult
+                    }
+                    catch (Exception ex)
                     {
-                        Success = false,
-                        ErrorMessage = ex.Message
-                    });
-                }
+                        CleanupTempFile(thisTempFilePath);
+                        tcsDownload.TrySetResult(new DownloadResult
+                        {
+                            Success = false,
+                            ErrorMessage = ex.Message
+                        });
+                    }
+                };
             }
 
             _webView.CoreWebView2.DownloadStarting += OnDownloadStarting;
             try
             {
                 Logger.Info($"Otevírám detail položky pro stažení: {item.PhotoUrl}");
-                await NavigateAndWaitForDomAsync(item.PhotoUrl, 15000);
+                bool navOk = await NavigateAndWaitForDomAsync(item.PhotoUrl, 15000);
+                if (!navOk)
+                {
+                    return new DownloadResult
+                    {
+                        Success = false,
+                        ErrorMessage = $"Nepodařilo se načíst detail položky '{item.MediaKey}'."
+                    };
+                }
+
                 await Task.Delay(1500, ct);
+
+                var currentUrl = _webView.CoreWebView2.Source ?? "";
+                if (!IsExactPhotoDetailUrl(currentUrl, item.MediaKey))
+                {
+                    return new DownloadResult
+                    {
+                        Success = false,
+                        ErrorMessage = $"Otevřená adresa '{currentUrl}' neodpovídá požadované položce '{item.MediaKey}'."
+                    };
+                }
 
                 // Method 1: Trigger Shift+D via CDP + JS KeyboardEvent
                 await DispatchShiftDAsync();
 
                 var startCheck1 = await Task.WhenAny(tcsDownload.Task, Task.Delay(3000, ct));
-                if (startCheck1 != tcsDownload.Task && tempFilePath == null)
+                bool isStarted;
+                lock (downloadSync) { isStarted = downloadStarted; }
+
+                if (startCheck1 != tcsDownload.Task && !isStarted)
                 {
                     // Method 2: Click 'More options' (three dots) -> 'Download / Stáhnout' in Google Photos UI
                     Logger.Info($"Zkouším stahování přes menu 'Další možnosti -> Stáhnout' pro {item.MediaKey}...");
-                    await TriggerDownloadFromUiMenuAsync();
+                    bool menuClicked = await TriggerDownloadFromUiMenuAsync();
+                    if (!menuClicked)
+                    {
+                        Logger.Warn($"Menu 'Další možnosti -> Stáhnout' nebylo u položky '{item.MediaKey}' nalezeno.");
+                    }
                 }
 
                 var startCheck2 = await Task.WhenAny(tcsDownload.Task, Task.Delay(3500, ct));
-                if (startCheck2 != tcsDownload.Task && tempFilePath == null)
+                lock (downloadSync) { isStarted = downloadStarted; }
+
+                if (startCheck2 != tcsDownload.Task && !isStarted)
                 {
-                    // Method 3: Direct googleusercontent.com '=d' original download link extraction
-                    Logger.Info($"Zkouším přímý stahovací odkaz (=d) pro {item.MediaKey}...");
-                    await TriggerDirectGoogleUserContentDownloadAsync();
+                    // Method 3: Direct googleusercontent.com download link extraction
+                    Logger.Info($"Zkouším přímý stahovací odkaz pro {item.MediaKey}...");
+                    bool directTriggered = await TriggerDirectGoogleUserContentDownloadAsync(item.IsVideo);
+                    if (!directTriggered)
+                    {
+                        Logger.Warn($"Přímý stahovací odkaz nebyl u položky '{item.MediaKey}' nalezen.");
+                    }
+
+                    // P3-22: Počkat krátce na zahájení stahování z 3. metody; pokud vůbec nezačne, nečekat 10 minut
+                    await Task.WhenAny(tcsDownload.Task, Task.Delay(4000, ct));
+                    lock (downloadSync) { isStarted = downloadStarted; }
+
+                    if (!isStarted && !tcsDownload.Task.IsCompleted)
+                    {
+                        return new DownloadResult
+                        {
+                            Success = false,
+                            ErrorMessage = "Nepodařilo se spustit stahování položky v rozhraní Google Photos (ovládací prvky pro stažení nebyly nalezeny)."
+                        };
+                    }
                 }
 
                 // Wait for download completion (up to 10 minutes for large videos)
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(TimeSpan.FromMinutes(10));
 
-                var completedTask = await Task.WhenAny(
-                    tcsDownload.Task,
-                    Task.Delay(Timeout.Infinite, timeoutCts.Token));
+                Task completedTask;
+                try
+                {
+                    completedTask = await Task.WhenAny(
+                        tcsDownload.Task,
+                        Task.Delay(Timeout.Infinite, timeoutCts.Token));
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    completedTask = Task.CompletedTask;
+                }
 
                 if (completedTask != tcsDownload.Task)
                 {
+                    try { activeDownloadOp?.Cancel(); } catch { }
+                    CleanupTempFile(activeTempPath);
+                    ct.ThrowIfCancellationRequested();
+
                     return new DownloadResult
                     {
                         Success = false,
@@ -613,22 +1332,38 @@ public class GooglePhotosEngine : IDisposable
                 var res = await tcsDownload.Task;
                 if (!res.Success || res.SkippedVideo)
                 {
-                    CleanupTempFile(tempFilePath);
+                    CleanupTempFile(res.FullPath);
+                    CleanupTempFile(activeTempPath);
                     return res;
+                }
+
+                // P1-11 & Bod 11: Ověřit, že stažený soubor odpovídá očekávanému typu a při chybě uklidit .part
+                var validation = ExifService.ValidateDownloadedMediaFile(res.FullPath, res.LocalFileName, item.IsVideo);
+                if (!validation.IsValid)
+                {
+                    CleanupTempFile(res.FullPath);
+                    CleanupTempFile(activeTempPath);
+                    return new DownloadResult
+                    {
+                        Success = false,
+                        ErrorMessage = validation.ErrorMessage
+                    };
                 }
 
                 // Move .part file to final unique filename in targetFolder
                 var finalPath = GetUniqueFilePath(targetFolder, res.LocalFileName);
                 File.Move(res.FullPath, finalPath, overwrite: true);
 
-                var fileInfo = new FileInfo(finalPath);
                 var takenAt = ExifService.ApplyCaptureTimestampToFile(finalPath, item.EstimatedDate);
+                var fileInfo = new FileInfo(finalPath);
+                var fileHash = ExifService.ComputeFastFileHash(finalPath);
 
                 return new DownloadResult
                 {
                     Success = true,
                     LocalFileName = Path.GetFileName(finalPath),
                     FullPath = finalPath,
+                    FileHash = fileHash,
                     FileSize = fileInfo.Length,
                     TakenAt = takenAt
                 };
@@ -640,10 +1375,14 @@ public class GooglePhotosEngine : IDisposable
         }
         catch (OperationCanceledException)
         {
+            try { activeDownloadOp?.Cancel(); } catch { }
+            CleanupTempFile(activeTempPath);
             throw;
         }
         catch (Exception ex)
         {
+            try { activeDownloadOp?.Cancel(); } catch { }
+            CleanupTempFile(activeTempPath);
             return new DownloadResult
             {
                 Success = false,
@@ -657,113 +1396,263 @@ public class GooglePhotosEngine : IDisposable
     }
 
     /// <summary>
-    /// Obousměrná synchronizace: Přesune fotku/video s daným MediaKey do koše v Google Photos.
+    /// P0-4, P1-5, P1-6 & Bod 9: Obousměrná synchronizace – přesune fotku/video s daným MediaKey do koše v Google Photos.
+    /// Před kliknutím přísně ověří navigaci, shodu URL/MediaKey a aktivní prohlížeč fotky.
+    /// Úspěch smazání NIKDY nebere z pouhého opuštění URL: vyžaduje buď explicitní toast „Přesunuto do koše“,
+    /// nebo následné ověření nedostupnosti položky při novém načtení její URL.
     /// </summary>
     public async Task<bool> MoveToTrashAsync(string mediaKey, string photoUrl, CancellationToken ct = default)
     {
+        if (string.IsNullOrWhiteSpace(mediaKey) || mediaKey.Length < 15)
+        {
+            Logger.Error("Nelze přesunout položku do koše: chybí platný identifikátor MediaKey.");
+            return false;
+        }
+
         await _operationLock.WaitAsync(ct);
         try
         {
             await EnsureInitializedAsync();
-            var url = !string.IsNullOrWhiteSpace(photoUrl)
-                ? photoUrl
-                : $"https://photos.google.com/photo/{mediaKey}";
+            var targetUrl = $"https://photos.google.com/photo/{mediaKey}";
 
-            Logger.Info($"Obousměrná synchronizace: Přesouvám položku '{mediaKey}' do koše v Google Photos...");
+            Logger.Info($"Obousměrná synchronizace: Otevírám položku '{mediaKey}' pro přesun do koše...");
 
-            await NavigateAndWaitForDomAsync(url, 15000);
+            bool navOk = await NavigateAndWaitForDomAsync(targetUrl, 15000);
+            if (!navOk)
+            {
+                Logger.Error($"Mazání zastaveno: navigace na detail položky '{mediaKey}' selhala nebo vypršel časový limit.");
+                return false;
+            }
+
             await Task.Delay(1500, ct);
 
-            // Check if already deleted / 404
-            var notFoundCheck = await _webView.CoreWebView2.ExecuteScriptAsync(@"
-                (() => {
-                    const txt = document.body ? document.body.innerText : '';
-                    return /Can't access photo|Nelze získat přístup|404|není k dispozici/i.test(txt);
-                })();
-            ");
-            if (notFoundCheck == "true")
+            var currentUrl = _webView.CoreWebView2.Source ?? "";
+            if (IsLoginOrMarketingUrl(currentUrl))
             {
-                Logger.Info($"Položka '{mediaKey}' již v Google Photos neexistuje (byla smazána dříve).");
+                _isKnownLoggedIn = false;
+                _manuallyConfirmedSessionEmail = null;
+                Logger.Error($"Mazání zastaveno: uživatel není přihlášen ke Google Photos (URL: {currentUrl}).");
+                return false;
+            }
+
+            if (!IsExactPhotoDetailUrl(currentUrl, mediaKey))
+            {
+                Logger.Error($"Mazání zastaveno: otevřená URL '{currentUrl}' neodpovídá položce '{mediaKey}'.");
+                return false;
+            }
+
+            // P1-6: Přesná kontrola, zda položka již nebyla smazána dříve (bez falešné shody '404' v textu)
+            if (await CheckIfPhotoAlreadyDeletedInDomAsync(mediaKey))
+            {
+                Logger.Info($"Položka '{mediaKey}' již v Google Photos neexistuje (ověřená chybová stránka).");
                 return true;
             }
 
-            // 1. Click Delete / Move to trash toolbar icon (or dispatch '#' key)
-            var clickedToolbarTrash = await _webView.CoreWebView2.ExecuteScriptAsync(@"
-                (() => {
+            // P0-4: Ověřit, že je na stránce vykreslen detail správné fotky a kliknout na tlačítko koše v horní liště
+            var safeMediaKeyJson = JsonSerializer.Serialize(mediaKey);
+            var clickTrashScript = $@"
+                (() => {{
+                    const expectedKey = {safeMediaKeyJson};
+                    const path = window.location.pathname || '';
+                    if (!path.endsWith('/photo/' + expectedKey) && !path.includes('/photo/' + expectedKey + '/')) {{
+                        return 'ERR_URL_MISMATCH:' + path;
+                    }}
+
+                    if (document.querySelector('[role=""dialog""], [role=""alertdialog""]')) {{
+                        return 'ERR_DIALOG_ALREADY_OPEN';
+                    }}
+
+                    const hasViewer = document.querySelector('img[src*=""googleusercontent.com""], video, [aria-label*=""Zavřít""], [aria-label*=""Close""]') !== null;
+                    if (!hasViewer) {{
+                        return 'ERR_NO_VIEWER';
+                    }}
+
                     const selectors = [
+                        'button[aria-label=""Smazat""]',
+                        'button[aria-label=""Přesunout do koše""]',
+                        'button[aria-label=""Delete""]',
+                        'button[aria-label=""Move to trash""]',
+                        'button[aria-label=""Move to bin""]',
                         'button[aria-label*=""Smazat""]',
                         'button[aria-label*=""Přesunout do koše""]',
                         'button[aria-label*=""Delete""]',
                         'button[aria-label*=""Move to trash""]',
                         'button[aria-label*=""Move to bin""]',
                         '[data-delete-origin] button',
-                        'div[role=""button""][aria-label*=""Smazat""]',
-                        'div[role=""button""][aria-label*=""Delete""]'
+                        'div[role=""button""][aria-label=""Smazat""]',
+                        'div[role=""button""][aria-label=""Delete""]'
                     ];
-                    for (const sel of selectors) {
-                        const btns = Array.from(document.querySelectorAll(sel))
-                            .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
-                        if (btns.length > 0) {
-                            btns[btns.length - 1].click();
-                            return true;
-                        }
-                    }
-                    return false;
-                })();
-            ");
 
-            if (clickedToolbarTrash != "true")
+                    for (const sel of selectors) {{
+                        const btns = Array.from(document.querySelectorAll(sel))
+                            .filter(b => b.offsetParent !== null &&
+                                         b.getBoundingClientRect().width > 0 &&
+                                         b.getBoundingClientRect().top >= 0 &&
+                                         b.getBoundingClientRect().top < 160 &&
+                                         !b.closest('[role=""dialog""], [role=""alertdialog""]'));
+                        if (btns.length === 1) {{
+                            btns[0].click();
+                            return 'CLICKED';
+                        }}
+                        if (btns.length > 1) {{
+                            btns[btns.length - 1].click();
+                            return 'CLICKED';
+                        }}
+                    }}
+                    return 'ERR_NO_TRASH_BUTTON';
+                }})();
+            ";
+
+            var trashClickRaw = await _webView.CoreWebView2.ExecuteScriptAsync(clickTrashScript);
+            var trashClickStatus = JsonSerializer.Deserialize<string>(trashClickRaw ?? "\"\"") ?? "";
+
+            if (trashClickStatus != "CLICKED")
             {
-                await DispatchHashKeyAsync();
+                Logger.Error($"Mazání položky '{mediaKey}' zastaveno – nepodařilo se bezpečně kliknout na ikonu koše ({trashClickStatus}).");
+                return false;
             }
 
-            await Task.Delay(1000, ct);
+            await Task.Delay(800, ct);
 
-            // 2. Confirm modal dialog ("Přesunout do koše" / "Move to trash")
-            for (int attempt = 0; attempt < 5; attempt++)
+            // 2. P0-4 & P1-5: Najít a potvrdit výhradně modální potvrzovací dialog přesunu do koše (žádný Enter naslepo!)
+            bool dialogConfirmed = false;
+            for (int attempt = 0; attempt < 6; attempt++)
             {
-                var confirmed = await _webView.CoreWebView2.ExecuteScriptAsync(@"
-                    (() => {
-                        const dialogs = Array.from(document.querySelectorAll('[role=""dialog""], [role=""alertdialog""], .VfPpkd-P5QLlc'));
-                        for (const dlg of dialogs) {
-                            const buttons = Array.from(dlg.querySelectorAll('button, [role=""button""]'));
-                            const confirmBtn = buttons.find(b => {
+                var confirmScript = $@"
+                    (() => {{
+                        const expectedKey = {safeMediaKeyJson};
+                        const path = window.location.pathname || '';
+                        if (!path.endsWith('/photo/' + expectedKey) && !path.includes('/photo/' + expectedKey + '/')) {{
+                            return 'ERR_URL_CHANGED';
+                        }}
+
+                        const dialogs = Array.from(document.querySelectorAll('[role=""dialog""], [role=""alertdialog""], .VfPpkd-P5QLlc'))
+                            .filter(d => d.offsetParent !== null || d.getBoundingClientRect().width > 0);
+
+                        for (const dlg of dialogs) {{
+                            const buttons = Array.from(dlg.querySelectorAll('button, [role=""button""]'))
+                                .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
+                            const confirmBtn = buttons.find(b => {{
                                 const t = (b.innerText || b.getAttribute('aria-label') || '').trim();
-                                return /Přesunout do koše|Smazat|Move to trash|Move to bin|Delete|Got it/i.test(t);
-                            }) || dlg.querySelector('button[data-mdc-dialog-action=""ok""]');
+                                return /^(Přesunout do koše|Smazat|Move to trash|Move to bin|Delete)$/i.test(t);
+                            }}) || dlg.querySelector('button[data-mdc-dialog-action=""ok""]');
 
-                            if (confirmBtn) {
+                            if (confirmBtn) {{
                                 confirmBtn.click();
-                                return true;
-                            }
-                        }
+                                return 'CONFIRMED';
+                            }}
+                        }}
+                        return 'WAITING';
+                    }})();
+                ";
 
-                        const allBtns = Array.from(document.querySelectorAll('button'));
-                        const globalConfirm = allBtns.find(b => {
-                            const t = (b.innerText || '').trim();
-                            return /^(Přesunout do koše|Move to trash|Move to bin)$/i.test(t) && b.offsetParent !== null;
-                        });
-                        if (globalConfirm) {
-                            globalConfirm.click();
-                            return true;
-                        }
-                        return false;
-                    })();
-                ");
+                var confirmRaw = await _webView.CoreWebView2.ExecuteScriptAsync(confirmScript);
+                var confirmStatus = JsonSerializer.Deserialize<string>(confirmRaw ?? "\"\"") ?? "";
 
-                if (confirmed == "true")
+                if (confirmStatus == "CONFIRMED")
                 {
-                    await Task.Delay(1200, ct);
-                    Logger.Info($"Položka '{mediaKey}' byla úspěšně přesunuta do koše v Google Photos.");
-                    return true;
+                    dialogConfirmed = true;
+                    break;
+                }
+                if (confirmStatus.StartsWith("ERR_", StringComparison.Ordinal))
+                {
+                    Logger.Error($"Mazání položky '{mediaKey}' zastaveno při čekání na potvrzovací dialog ({confirmStatus}).");
+                    return false;
                 }
 
-                await Task.Delay(500, ct);
+                await Task.Delay(450, ct);
             }
 
-            await DispatchEnterKeyAsync();
-            await Task.Delay(1000, ct);
-            return true;
+            if (!dialogConfirmed)
+            {
+                Logger.Error($"Mazání položky '{mediaKey}' nebylo potvrzeno – potvrzovací dialog Google Photos se nezobrazil.");
+                return false;
+            }
+
+            // 3. Bod 9: Ověřit skutečný výsledek přesunu do koše.
+            // Pouhé opuštění URL NENÍ důkazem smazání! Vyžadujeme buď toast „Přesunuto do koše“,
+            // nebo následné ověření nedostupnosti položky při novém načtení její URL.
+            for (int verifyAttempt = 0; verifyAttempt < 10; verifyAttempt++)
+            {
+                await Task.Delay(500, ct);
+
+                var postUrl = _webView.CoreWebView2.Source ?? "";
+                if (IsLoginOrMarketingUrl(postUrl))
+                {
+                    _isKnownLoggedIn = false;
+                    _manuallyConfirmedSessionEmail = null;
+                    Logger.Error($"Mazání položky '{mediaKey}' selhalo: prohlížeč byl přesměrován na přihlašovací stránku ({postUrl}).");
+                    return false;
+                }
+
+                var verifyScript = $@"
+                    (() => {{
+                        const expectedKey = {safeMediaKeyJson};
+                        const path = window.location.pathname || '';
+                        const urlChangedAway = !path.includes(expectedKey);
+
+                        const bodyText = document.body ? (document.body.innerText || '') : '';
+                        const hasTrashToast = /Přesunuto do koše|Položka byla přesunuta do koše|Moved to trash|Moved to bin/i.test(bodyText);
+                        const hasErrorToast = /Nelze přesunout do koše|Chyba při mazání|Can't move to trash|Couldn't delete/i.test(bodyText);
+
+                        return JSON.stringify({{
+                            urlChangedAway: urlChangedAway,
+                            hasTrashToast: hasTrashToast,
+                            hasErrorToast: hasErrorToast
+                        }});
+                    }})();
+                ";
+
+                var verifyRaw = await _webView.CoreWebView2.ExecuteScriptAsync(verifyScript);
+                if (!string.IsNullOrWhiteSpace(verifyRaw) && verifyRaw != "null")
+                {
+                    var verifyJson = JsonSerializer.Deserialize<string>(verifyRaw);
+                    if (!string.IsNullOrWhiteSpace(verifyJson))
+                    {
+                        using var doc = JsonDocument.Parse(verifyJson);
+                        bool urlChangedAway = doc.RootElement.GetProperty("urlChangedAway").GetBoolean();
+                        bool hasTrashToast = doc.RootElement.GetProperty("hasTrashToast").GetBoolean();
+                        bool hasErrorToast = doc.RootElement.GetProperty("hasErrorToast").GetBoolean();
+
+                        if (hasErrorToast)
+                        {
+                            Logger.Error($"Google Photos ohlásilo chybu při přesouvání položky '{mediaKey}' do koše.");
+                            return false;
+                        }
+
+                        if (hasTrashToast)
+                        {
+                            Logger.Info($"Položka '{mediaKey}' byla ověřeně přesunuta do koše v Google Photos (potvrzeno hláškou 'Přesunuto do koše').");
+                            return true;
+                        }
+
+                        if (urlChangedAway)
+                        {
+                            // URL se změnila (např. přechod na další fotku), ale toast jsme nezachytili -> přejdeme rovnou na ověření přes opětovné načtení URL
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Bod 9: Znovu načíst detail mazané fotky a ověřit, že je skutečně nedostupná (404 / smazaná)
+            if (await NavigateAndWaitForDomAsync(targetUrl, 10000))
+            {
+                await Task.Delay(1000, ct);
+                var verifyUrl = _webView.CoreWebView2.Source ?? "";
+                if (!IsLoginOrMarketingUrl(verifyUrl) && await CheckIfPhotoAlreadyDeletedInDomAsync(mediaKey))
+                {
+                    Logger.Info($"Položka '{mediaKey}' byla ověřeně přesunuta do koše (při opětovném načtení již neexistuje).");
+                    return true;
+                }
+            }
+
+            Logger.Error($"Nepodařilo se potvrdit, že položka '{mediaKey}' byla skutečně přesunuta do koše. Zůstává ve frontě k opakování.");
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -774,6 +1663,97 @@ public class GooglePhotosEngine : IDisposable
         {
             _operationLock.Release();
         }
+    }
+
+    public static bool IsExactPhotoDetailUrl(string? currentUrl, string mediaKey)
+    {
+        if (string.IsNullOrWhiteSpace(currentUrl) || string.IsNullOrWhiteSpace(mediaKey))
+            return false;
+
+        if (!Uri.TryCreate(currentUrl, UriKind.Absolute, out var uri))
+            return false;
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(uri.Host, "photos.google.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var path = uri.AbsolutePath.TrimEnd('/');
+        return path.EndsWith($"/photo/{mediaKey}", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// P1-6: Čistá testovatelná logika pro rozlišení skutečné chybové stránky Google Photos od běžné fotky
+    /// (nikdy nehledá samotné číslo '404' v celém textu stránky, kde může být v názvu souboru IMG_0404.JPG).
+    /// </summary>
+    public static bool IsPhotoUnavailablePage(
+        string? currentUrl,
+        string mediaKey,
+        string? pageTitle,
+        string? headingText,
+        bool hasActivePhotoViewerOrDeleteButton)
+    {
+        if (hasActivePhotoViewerOrDeleteButton)
+            return false;
+
+        if (!IsExactPhotoDetailUrl(currentUrl, mediaKey))
+            return false;
+
+        var title = (pageTitle ?? "").Trim();
+        var heading = (headingText ?? "").Trim();
+
+        if (Regex.IsMatch(title, @"Error\s+404\b|Chyba\s+404\b|Not\s+Found", RegexOptions.IgnoreCase))
+            return true;
+
+        if (Regex.IsMatch(heading, @"Can't access photo|Nelze získat přístup k fotce|Položka nebyla nalezena|404\.\s*That’s an error|404\.\s*That's an error", RegexOptions.IgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    private async Task<bool> CheckIfPhotoAlreadyDeletedInDomAsync(string mediaKey)
+    {
+        var checkScript = @"
+            (() => {
+                const hasViewerOrDelete = document.querySelector(
+                    'img[src*=""googleusercontent.com""]:not([src*=""/a/""]), ' +
+                    'video, ' +
+                    'button[aria-label*=""Smazat""], ' +
+                    'button[aria-label*=""Přesunout do koše""], ' +
+                    'button[aria-label*=""Delete""], ' +
+                    'button[aria-label*=""Move to trash""]'
+                ) !== null;
+
+                const headings = Array.from(document.querySelectorAll('h1, h2, [role=""heading""], .error-code, p'))
+                    .slice(0, 10)
+                    .map(el => (el.innerText || '').trim())
+                    .join(' | ');
+
+                return JSON.stringify({
+                    url: window.location.href || '',
+                    title: document.title || '',
+                    headings: headings,
+                    hasViewerOrDelete: hasViewerOrDelete
+                });
+            })();
+        ";
+
+        var raw = await _webView.CoreWebView2.ExecuteScriptAsync(checkScript);
+        if (string.IsNullOrWhiteSpace(raw) || raw == "null")
+            return false;
+
+        var inner = JsonSerializer.Deserialize<string>(raw);
+        if (string.IsNullOrWhiteSpace(inner))
+            return false;
+
+        using var doc = JsonDocument.Parse(inner);
+        var url = doc.RootElement.GetProperty("url").GetString();
+        var title = doc.RootElement.GetProperty("title").GetString();
+        var headings = doc.RootElement.GetProperty("headings").GetString();
+        var hasViewer = doc.RootElement.GetProperty("hasViewerOrDelete").GetBoolean();
+
+        return IsPhotoUnavailablePage(url, mediaKey, title, headings, hasViewer);
     }
 
     private async Task DispatchShiftDAsync()
@@ -788,7 +1768,6 @@ public class GooglePhotosEngine : IDisposable
             await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent",
                 @"{""type"":""keyUp"",""modifiers"":8,""windowsVirtualKeyCode"":68,""nativeVirtualKeyCode"":68,""key"":""D"",""code"":""KeyD""}");
 
-            // Also dispatch synthetic JS keyboard event in case focus is inside a custom element
             await _webView.CoreWebView2.ExecuteScriptAsync(@"
                 (() => {
                     const target = document.activeElement || document.body;
@@ -806,41 +1785,11 @@ public class GooglePhotosEngine : IDisposable
         }
     }
 
-    private async Task DispatchHashKeyAsync()
+    private async Task<bool> TriggerDownloadFromUiMenuAsync()
     {
         try
         {
-            await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent",
-                @"{""type"":""char"",""text"":""#""}");
-        }
-        catch (Exception ex)
-        {
-            Logger.Warn($"Nelze odeslat zkratku '#': {ex.Message}");
-        }
-    }
-
-    private async Task DispatchEnterKeyAsync()
-    {
-        try
-        {
-            await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent",
-                @"{""type"":""keyDown"",""windowsVirtualKeyCode"":13,""key"":""Enter"",""code"":""Enter""}");
-            await Task.Delay(60);
-            await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent",
-                @"{""type"":""keyUp"",""windowsVirtualKeyCode"":13,""key"":""Enter"",""code"":""Enter""}");
-        }
-        catch
-        {
-            // Ignore
-        }
-    }
-
-    private async Task TriggerDownloadFromUiMenuAsync()
-    {
-        try
-        {
-            // Pick the LAST visible 'More options' button in the DOM (which belongs to the active photo overlay)
-            await _webView.CoreWebView2.ExecuteScriptAsync(@"
+            var openMenuRaw = await _webView.CoreWebView2.ExecuteScriptAsync(@"
                 (() => {
                     const moreBtns = Array.from(document.querySelectorAll(
                         'button[aria-label*=""Další možnosti""], button[aria-label*=""More options""], ' +
@@ -849,11 +1798,18 @@ public class GooglePhotosEngine : IDisposable
 
                     if (moreBtns.length > 0) {
                         moreBtns[moreBtns.length - 1].click();
+                        return true;
                     }
+                    return false;
                 })();
             ");
+
+            if (openMenuRaw != "true")
+                return false;
+
             await Task.Delay(600);
-            await _webView.CoreWebView2.ExecuteScriptAsync(@"
+
+            var clickDownloadRaw = await _webView.CoreWebView2.ExecuteScriptAsync(@"
                 (() => {
                     const items = Array.from(document.querySelectorAll('[role=""menuitem""], [role=""option""], li, button, a'))
                         .filter(el => el.offsetParent !== null && el.getBoundingClientRect().width > 0);
@@ -861,33 +1817,52 @@ public class GooglePhotosEngine : IDisposable
                         const txt = (el.innerText || el.getAttribute('aria-label') || '').trim();
                         return /^(Stáhnout|Download)(\b|\s|Shift)/i.test(txt) || /Stáhnout originál|Download original/i.test(txt);
                     });
-                    if (dl) dl.click();
+                    if (dl) {
+                        dl.click();
+                        return true;
+                    }
+                    return false;
                 })();
             ");
+
+            return clickDownloadRaw == "true";
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore
+            Logger.Warn($"Chyba při pokusu o stažení přes menu UI: {ex.Message}");
+            return false;
         }
     }
 
-    private async Task TriggerDirectGoogleUserContentDownloadAsync()
+    private async Task<bool> TriggerDirectGoogleUserContentDownloadAsync(bool isVideo)
     {
         try
         {
-            // Find the main high-res photo/video URL on the photo detail page and append '=d' to force original file download
-            var directUrlJson = await _webView.CoreWebView2.ExecuteScriptAsync(@"
-                (() => {
+            // P1-11: U videa nejprve hledat skutečný video stream nebo použít parametr '=dv' (nikoliv '=d' na náhledu)
+            var suffix = isVideo ? "=dv" : "=d";
+            var safeSuffix = JsonSerializer.Serialize(suffix);
+            var isVideoJson = isVideo ? "true" : "false";
+
+            var directUrlJson = await _webView.CoreWebView2.ExecuteScriptAsync($@"
+                (() => {{
+                    const wantVideo = {isVideoJson};
+                    if (wantVideo) {{
+                        const vid = document.querySelector('video[src*=""googleusercontent.com""], video source[src*=""googleusercontent.com""]');
+                        if (vid && vid.src) {{
+                            return vid.src;
+                        }}
+                    }}
+
                     const imgs = Array.from(document.querySelectorAll('img[src*=""googleusercontent.com""]'))
                         .filter(img => img.src && !img.src.includes('/a/') && !img.src.includes('=s'))
                         .sort((a, b) => (b.naturalWidth * b.naturalHeight || b.clientWidth * b.clientHeight) - (a.naturalWidth * a.naturalHeight || a.clientWidth * a.clientHeight));
 
-                    if (imgs.length > 0) {
+                    if (imgs.length > 0) {{
                         let baseUrl = imgs[0].src.split('=')[0];
-                        return baseUrl + '=d';
-                    }
+                        return baseUrl + {safeSuffix};
+                    }}
                     return '';
-                })();
+                }})();
             ");
 
             var directUrl = JsonSerializer.Deserialize<string>(directUrlJson ?? "\"\"");
@@ -903,15 +1878,22 @@ public class GooglePhotosEngine : IDisposable
                         a.remove();
                     }})();
                 ");
+                return true;
             }
+
+            return false;
         }
         catch (Exception ex)
         {
-            Logger.Warn($"Nelze spustit přímé stažení (=d): {ex.Message}");
+            Logger.Warn($"Nelze spustit přímé stažení: {ex.Message}");
+            return false;
         }
     }
 
-    private async Task NavigateAndWaitForDomAsync(string url, int timeoutMs)
+    /// <summary>
+    /// P0-4: Naviguje na zadanou adresu a vrací true pouze tehdy, když navigace skončila v časovém limitu a s IsSuccess == true.
+    /// </summary>
+    private async Task<bool> NavigateAndWaitForDomAsync(string url, int timeoutMs)
     {
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -924,11 +1906,18 @@ public class GooglePhotosEngine : IDisposable
         try
         {
             _webView.CoreWebView2.Navigate(url);
-            await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
+            var completed = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
+            if (completed != tcs.Task)
+            {
+                Logger.Warn($"Navigace na '{url}' překročila časový limit ({timeoutMs} ms).");
+                return false;
+            }
+            return await tcs.Task;
         }
         catch (Exception ex)
         {
-            Logger.Warn($"Navigace na '{url}' hlásí varování: {ex.Message}");
+            Logger.Warn($"Navigace na '{url}' selhala: {ex.Message}");
+            return false;
         }
         finally
         {
@@ -936,15 +1925,21 @@ public class GooglePhotosEngine : IDisposable
         }
     }
 
-    private static DateTime? ParseDateFromAriaLabel(string label)
+    /// <summary>
+    /// P3-17: Parsuje datum z popisku Google Photos (česky i anglicky).
+    /// Pokud v popisku chybí rok a odvozené datum v letošním roce by leželo v budoucnosti, použije předchozí rok.
+    /// </summary>
+    public static DateTime? ParseDateFromAriaLabel(string? label, DateTime? referenceToday = null)
     {
         if (string.IsNullOrWhiteSpace(label)) return null;
 
+        var today = (referenceToday ?? DateTime.Today).Date;
         var trimmed = label.Trim();
+
         if (Regex.IsMatch(trimmed, @"\b(dnes|today)\b", RegexOptions.IgnoreCase))
-            return DateTime.Today;
+            return today;
         if (Regex.IsMatch(trimmed, @"\b(včera|vcera|yesterday)\b", RegexOptions.IgnoreCase))
-            return DateTime.Today.AddDays(-1);
+            return today.AddDays(-1);
 
         // 1. Try numeric Czech format: "19. 10. 2026" or "19. 10."
         var czNumMatch = Regex.Match(trimmed, @"(?<d>\d{1,2})\.\s*(?<m>\d{1,2})\.(\s*(?<y>20\d{2}))?");
@@ -952,50 +1947,94 @@ public class GooglePhotosEngine : IDisposable
             int.TryParse(czNumMatch.Groups["m"].Value, out int mNum) && mNum is >= 1 and <= 12 &&
             int.TryParse(czNumMatch.Groups["d"].Value, out int dNum) && dNum is >= 1 and <= 31)
         {
-            int yNum = czNumMatch.Groups["y"].Success && int.TryParse(czNumMatch.Groups["y"].Value, out int parsedY)
-                ? parsedY
-                : DateTime.Today.Year;
-            try { return new DateTime(yNum, mNum, dNum); } catch { }
+            bool hasExplicitYear = czNumMatch.Groups["y"].Success && int.TryParse(czNumMatch.Groups["y"].Value, out _);
+            int yNum = hasExplicitYear ? int.Parse(czNumMatch.Groups["y"].Value) : today.Year;
+            var dt = TryConstructDateWithRollover(yNum, mNum, dNum, hasExplicitYear, today);
+            if (dt.HasValue) return dt.Value;
         }
 
-        // 2. Try Czech word month format: "19. října 2026" or "19. října"
-        var czWordMatch = Regex.Match(trimmed, @"(?<d>\d{1,2})\.\s*(?<month>[a-zA-ZáčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]+)(\s+(?<y>20\d{2}))?");
+        // 2. Try Day + word month format: "19. října 2026", "19. října", "19 Oct 2026", "19 Oct"
+        var czWordMatch = Regex.Match(trimmed, @"\b(?<d>\d{1,2})\.?\s+(?<month>[a-zA-ZáčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]+)(?:[,\s]+(?<y>20\d{2}))?\b");
         if (czWordMatch.Success &&
             int.TryParse(czWordMatch.Groups["d"].Value, out int dWord) && dWord is >= 1 and <= 31)
         {
             var mName = czWordMatch.Groups["month"].Value;
             if (CzechMonths.TryGetValue(mName, out int mWord))
             {
-                int yWord = czWordMatch.Groups["y"].Success && int.TryParse(czWordMatch.Groups["y"].Value, out int parsedY2)
-                    ? parsedY2
-                    : DateTime.Today.Year;
-                try { return new DateTime(yWord, mWord, dWord); } catch { }
+                bool hasExplicitYear = czWordMatch.Groups["y"].Success && int.TryParse(czWordMatch.Groups["y"].Value, out _);
+                int yWord = hasExplicitYear ? int.Parse(czWordMatch.Groups["y"].Value) : today.Year;
+                var dt = TryConstructDateWithRollover(yWord, mWord, dWord, hasExplicitYear, today);
+                if (dt.HasValue) return dt.Value;
             }
         }
 
-        // 3. Try English / International formats inside aria-label: e.g. "Oct 19, 2026" or "19 Oct 2026"
+        // 2b. Try English Month + Day (+ optional Year) format: "Oct 16, 2026" or "Oct 16"
+        var enWordMatch = Regex.Match(trimmed, @"\b(?<month>[a-zA-Z]{3,9})\s+(?<d>\d{1,2})(?:[,\s]+(?<y>20\d{2}))?\b");
+        if (enWordMatch.Success &&
+            int.TryParse(enWordMatch.Groups["d"].Value, out int dEn) && dEn is >= 1 and <= 31)
+        {
+            var mName = enWordMatch.Groups["month"].Value;
+            if (CzechMonths.TryGetValue(mName, out int mEn))
+            {
+                bool hasExplicitYear = enWordMatch.Groups["y"].Success && int.TryParse(enWordMatch.Groups["y"].Value, out _);
+                int yEn = hasExplicitYear ? int.Parse(enWordMatch.Groups["y"].Value) : today.Year;
+                var dt = TryConstructDateWithRollover(yEn, mEn, dEn, hasExplicitYear, today);
+                if (dt.HasValue) return dt.Value;
+            }
+        }
+
+        // 3. Try English / International formats inside aria-label: e.g. "Oct 19, 2026", "19 Oct 2026", "Dec 28"
         var parts = trimmed.Split(['-', '–', '—', ',', ':'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         CultureInfo[] cultures = [new("cs-CZ"), CultureInfo.InvariantCulture, new("en-US"), new("en-GB")];
 
         for (int i = 0; i < parts.Length; i++)
         {
             var candidate = parts[i];
+            bool hasYearInCandidate = Regex.IsMatch(candidate, @"\b(19|20)\d{2}\b");
             if (i + 1 < parts.Length && Regex.IsMatch(parts[i + 1], @"^\d{4}"))
             {
                 candidate = $"{parts[i]}, {parts[i + 1]}";
+                hasYearInCandidate = true;
             }
 
             foreach (var culture in cultures)
             {
                 if (DateTime.TryParse(candidate, culture, DateTimeStyles.AllowWhiteSpaces, out var parsed) &&
-                    parsed.Year >= 1995 && parsed.Year <= DateTime.Now.Year + 1)
+                    parsed.Year >= 1995 && parsed.Year <= today.Year + 1)
                 {
-                    return parsed;
+                    if (!hasYearInCandidate)
+                    {
+                        var adjusted = TryConstructDateWithRollover(today.Year, parsed.Month, parsed.Day, hasExplicitYear: false, today);
+                        if (adjusted.HasValue) return adjusted.Value;
+                    }
+                    return parsed.Date;
                 }
             }
         }
 
         return null;
+    }
+
+    private static DateTime? TryConstructDateWithRollover(int year, int month, int day, bool hasExplicitYear, DateTime referenceToday)
+    {
+        try
+        {
+            var dt = new DateTime(year, month, day);
+            if (!hasExplicitYear && dt.Date > referenceToday.Date.AddDays(1))
+            {
+                dt = dt.AddYears(-1);
+            }
+            return dt;
+        }
+        catch
+        {
+            // Např. 29. února v nepřestupném roce -> zkusit předchozí rok, pokud nebyl rok explicitně zadán
+            if (!hasExplicitYear)
+            {
+                try { return new DateTime(year - 1, month, day); } catch { }
+            }
+            return null;
+        }
     }
 
     private static string GetUniqueFilePath(string folder, string fileName)

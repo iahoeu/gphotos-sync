@@ -15,6 +15,9 @@ public class TrayApplicationContext : ApplicationContext
 
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusMenuItem;
+    private readonly ToolStripMenuItem _unverifiedAccountMenuItem;
+    private readonly ToolStripMenuItem _approveBulkDeleteMenuItem;
+    private readonly ToolStripMenuItem _cancelBulkDeleteMenuItem;
     private readonly ToolStripMenuItem _syncNowMenuItem;
     private readonly ToolStripMenuItem _twoWayToggleMenuItem;
     private readonly ToolStripMenuItem _updateMenuItem;
@@ -39,6 +42,43 @@ public class TrayApplicationContext : ApplicationContext
         _iconWarn = IconGenerator.CreateTrayIcon(Color.FromArgb(235, 115, 25));    // Orange badge
 
         _statusMenuItem = new ToolStripMenuItem("Stav: Spouštím...") { Enabled = false };
+
+        _unverifiedAccountMenuItem = new ToolStripMenuItem("⚠️ Mazání vypnuto: Potvrdit e-mail účtu Google...")
+        {
+            Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount,
+            ForeColor = Color.FromArgb(195, 90, 15)
+        };
+        _unverifiedAccountMenuItem.Click += (_, _) =>
+        {
+            if (SettingsForm.PromptManualGoogleAccountConfirmation(null, _config, _syncEngine, _photosEngine))
+            {
+                _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
+            }
+        };
+
+        bool hasInitialBlockedBatch = _syncEngine.PendingBulkDeleteCount > 0;
+        _approveBulkDeleteMenuItem = new ToolStripMenuItem(
+            hasInitialBlockedBatch
+                ? $"⚠️ Potvrdit smazání {_syncEngine.PendingBulkDeleteCount} položek v Google Photos"
+                : "⚠️ Potvrdit hromadné smazání v Google Photos",
+            null,
+            async (_, _) =>
+            {
+                await _syncEngine.ApprovePendingBulkDeleteAsync();
+            })
+        {
+            Visible = hasInitialBlockedBatch,
+            ForeColor = Color.FromArgb(190, 40, 40)
+        };
+
+        _cancelBulkDeleteMenuItem = new ToolStripMenuItem("🛡️ Zrušit hromadné mazání (odpojit zablokovanou dávku)", null, (_, _) =>
+        {
+            _syncEngine.CancelPendingBulkDelete();
+        })
+        {
+            Visible = hasInitialBlockedBatch
+        };
+
         _syncNowMenuItem = new ToolStripMenuItem("🔄 Stáhnout nové fotky hned", null, async (_, _) =>
         {
             await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
@@ -55,6 +95,8 @@ public class TrayApplicationContext : ApplicationContext
         {
             _config.TwoWayDelete = _twoWayToggleMenuItem.Checked;
             _config.Save();
+            _syncEngine.UpdateConfiguration();
+            _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
             Logger.Info($"Obousměrné mazání bylo {(_config.TwoWayDelete ? "ZAPNUTO" : "VYPNUTO")}.");
         };
 
@@ -62,6 +104,20 @@ public class TrayApplicationContext : ApplicationContext
         {
             using var loginForm = new GoogleLoginForm(_photosEngine);
             loginForm.ShowDialog();
+            if (loginForm.LoginSucceeded)
+            {
+                _config.ExpectedGoogleAccountEmail = string.Empty;
+                var check = await _photosEngine.CheckLoginAndAccountAsync();
+                if (!string.IsNullOrWhiteSpace(check.DetectedEmail))
+                {
+                    _syncEngine.ConfirmGoogleAccountEmailManually(check.DetectedEmail);
+                }
+                else
+                {
+                    SettingsForm.PromptManualGoogleAccountConfirmation(null, _config, _syncEngine, _photosEngine);
+                }
+            }
+            _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
             await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
         });
 
@@ -76,6 +132,9 @@ public class TrayApplicationContext : ApplicationContext
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusMenuItem);
+        menu.Items.Add(_unverifiedAccountMenuItem);
+        menu.Items.Add(_approveBulkDeleteMenuItem);
+        menu.Items.Add(_cancelBulkDeleteMenuItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_syncNowMenuItem);
         menu.Items.Add(openFolderItem);
@@ -89,19 +148,29 @@ public class TrayApplicationContext : ApplicationContext
 
         _trayIcon = new NotifyIcon
         {
-            Icon = _iconIdle,
+            Icon = hasInitialBlockedBatch ? _iconWarn : _iconIdle,
             Text = "Google Photos Sync – Běží na pozadí",
             ContextMenuStrip = menu,
             Visible = true
         };
 
         _trayIcon.DoubleClick += (_, _) => OpenDownloadFolder();
-        _trayIcon.BalloonTipClicked += (_, _) => OpenDownloadFolder();
+        _trayIcon.BalloonTipClicked += (_, _) =>
+        {
+            if (_syncEngine.PendingBulkDeleteCount > 0 || _syncEngine.IsDeletePausedDueToUnverifiedAccount)
+            {
+                _trayIcon.ContextMenuStrip?.Show(Cursor.Position);
+            }
+            else
+            {
+                OpenDownloadFolder();
+            }
+        };
 
         _syncEngine.StatusChanged += OnSyncStatusChanged;
-        _syncEngine.ShowNotification += (title, msg) =>
+        _syncEngine.ShowNotification += (title, msg, icon) =>
         {
-            _trayIcon.ShowBalloonTip(4000, title, msg, ToolTipIcon.Info);
+            _trayIcon.ShowBalloonTip(5000, title, msg, icon);
         };
 
         // Check for Gitea updates every 6 hours
@@ -133,12 +202,55 @@ public class TrayApplicationContext : ApplicationContext
     {
         Logger.Info("Aplikace Google Photos Sync byla spuštěna.");
 
-        if (!_config.IsFirstRunCompleted)
+        // Bod 3 & 12: Pokud config.json chybí nebo je poškozený při existující DB, nabídnout obnovu z config.json.bak nebo otevřít Nastavení
+        if (_config.HasConfigLoadError)
         {
-            using var wizard = new SetupWizardForm(_config, _photosEngine);
+            if (AppConfig.HasBackupFile())
+            {
+                var restoreAsk = MessageBox.Show(
+                    $"{_config.ConfigLoadErrorMessage}\r\n\r\n" +
+                    "Byl nalezen záložní konfigurační soubor (config.json.bak).\r\n" +
+                    "Chcete konfiguraci nyní automaticky obnovit ze zálohy?",
+                    "Obnova konfiguračního souboru Google Photos Sync",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+
+                string? restoreErr = null;
+                if (restoreAsk == DialogResult.Yes && _config.TryRestoreFromBackup(out restoreErr))
+                {
+                    _twoWayToggleMenuItem.Checked = _config.TwoWayDelete;
+                    _syncEngine.UpdateConfiguration();
+                }
+                else
+                {
+                    if (!string.IsNullOrWhiteSpace(restoreErr))
+                    {
+                        MessageBox.Show(restoreErr, "Chyba obnovy ze zálohy", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                    ShowSettingsWindow();
+                    return;
+                }
+            }
+            else
+            {
+                MessageBox.Show(
+                    $"{_config.ConfigLoadErrorMessage}\r\n\r\n" +
+                    "Zkontrolujte a uložte prosím cílovou složku v okně Nastavení.",
+                    "Chybějící nebo poškozená konfigurace",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                ShowSettingsWindow();
+                return;
+            }
+        }
+
+        if (!_config.IsFirstRunCompleted && !_config.HasConfigLoadError)
+        {
+            using var wizard = new SetupWizardForm(_config, _photosEngine, _db);
             var res = wizard.ShowDialog();
             _twoWayToggleMenuItem.Checked = _config.TwoWayDelete;
             _syncEngine.UpdateConfiguration();
+            _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
 
             if (res == DialogResult.OK)
             {
@@ -222,7 +334,17 @@ public class TrayApplicationContext : ApplicationContext
         if (shortTooltip.Length > 63) shortTooltip = shortTooltip[..63];
         _trayIcon.Text = shortTooltip;
 
-        if (e.RequiresLogin)
+        _unverifiedAccountMenuItem.Visible = e.IsDeletePausedDueToUnverifiedAccount;
+
+        bool hasPendingBulkDelete = e.PendingBulkDeleteCount > 0;
+        _approveBulkDeleteMenuItem.Visible = hasPendingBulkDelete;
+        _cancelBulkDeleteMenuItem.Visible = hasPendingBulkDelete;
+        if (hasPendingBulkDelete)
+        {
+            _approveBulkDeleteMenuItem.Text = $"⚠️ Potvrdit smazání {e.PendingBulkDeleteCount} položek v Google Photos";
+        }
+
+        if (e.RequiresLogin || e.HasError || hasPendingBulkDelete || e.IsDeletePausedDueToUnverifiedAccount)
         {
             _trayIcon.Icon = _iconWarn;
         }
@@ -240,7 +362,29 @@ public class TrayApplicationContext : ApplicationContext
     {
         try
         {
-            Directory.CreateDirectory(_config.DownloadFolder);
+            if (_config.HasConfigLoadError)
+            {
+                ShowSettingsWindow();
+                return;
+            }
+
+            if (!Directory.Exists(_config.DownloadFolder))
+            {
+                if (_db.HasDownloadedOrPendingDeleteItems())
+                {
+                    MessageBox.Show(
+                        $"Cílová složka '{_config.DownloadFolder}' nebyla nalezena.\r\n" +
+                        "Zkontrolujte prosím připojení disku nebo upravte umístění v Nastavení.",
+                        "Složka nenalezena",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+
+                _config.InitializeFolderMarker(_config.DownloadFolder);
+                _config.Save();
+            }
+
             Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_config.DownloadFolder}\"")
             {
                 UseShellExecute = true
@@ -264,6 +408,7 @@ public class TrayApplicationContext : ApplicationContext
         _openSettingsForm.FormClosed += (_, _) =>
         {
             _twoWayToggleMenuItem.Checked = _config.TwoWayDelete;
+            _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
             _openSettingsForm = null;
         };
         _openSettingsForm.Show();

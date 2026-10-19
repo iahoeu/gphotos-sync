@@ -364,10 +364,16 @@ public class InstallerForm : Form
         _btnBack.Enabled = pageIndex == 1;
         if (pageIndex == 0)
         {
+            _btnNext.Enabled = true;
+            _btnCancel.Enabled = true;
             _btnNext.Text = "Další >";
+            _btnNext.BackColor = Color.FromArgb(26, 115, 232);
         }
         else if (pageIndex == 1)
         {
+            // Bod 14: Při přechodu nebo návratu tlačítkem Zpět vždy znovu povolit tlačítko Instalovat / Další
+            _btnNext.Enabled = true;
+            _btnCancel.Enabled = true;
             _btnNext.Text = "Instalovat";
             _btnNext.BackColor = Color.FromArgb(24, 138, 66);
         }
@@ -387,17 +393,84 @@ public class InstallerForm : Form
         }
     }
 
+    /// <summary>
+    /// Bod 2 (P0): Ověří, že instalační složka není shodná se složkou fotek ani její nadřazenou/podřazenou složkou,
+    /// že %LocalAppData%\GPhotosSync nezasahuje do složky fotek a že žádná cesta není kořenem disku.
+    /// </summary>
+    public static (bool IsValid, string? ErrorMessage) ValidateInstallationPaths(string installDirRaw, string photosDirRaw, string appDataDirRaw)
+    {
+        var installDir = (installDirRaw ?? "").Trim();
+        var photosDir = (photosDirRaw ?? "").Trim();
+        var appDataDir = (appDataDirRaw ?? "").Trim();
+
+        if (string.IsNullOrWhiteSpace(installDir) || Program.IsDriveRoot(installDir))
+        {
+            return (false, "Vyberte prosím platnou podsložku pro instalaci programu (nelze instalovat přímo do kořene disku).");
+        }
+
+        if (string.IsNullOrWhiteSpace(photosDir) || Program.IsDriveRoot(photosDir))
+        {
+            return (false, "Vyberte prosím platnou podsložku pro ukládání fotek (nelze použít přímo kořen disku).");
+        }
+
+        if (Program.ArePathsOverlapping(installDir, photosDir))
+        {
+            return (false,
+                "Instalační složka programu nesmí být shodná se složkou pro fotky ani nesmí být její nadřazenou či podřazenou složkou.\r\n\r\n" +
+                $"Instalační složka: {installDir}\r\n" +
+                $"Složka pro fotky: {photosDir}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(appDataDir) && Program.ArePathsOverlapping(appDataDir, photosDir))
+        {
+            return (false,
+                $"Složka pro fotky se nesmí překrývat s datovou složkou aplikace ({appDataDir}).\r\n" +
+                "Zvolte prosím pro fotky jinou složku (např. ve složce Obrázky).");
+        }
+
+        return (true, null);
+    }
+
     private async Task OnNextClickedAsync()
     {
         if (_currentPage == 0)
         {
+            var installDir = _txtInstallDir.Text.Trim();
+            if (string.IsNullOrWhiteSpace(installDir) || Program.IsDriveRoot(installDir))
+            {
+                MessageBox.Show(
+                    this,
+                    "Vyberte prosím platnou podsložku pro instalaci programu (nelze instalovat přímo do kořene disku).",
+                    "Neplatná složka instalace",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
             ShowPage(1);
         }
-        else if (_currentPage == 1)
+        else if (_currentPage == 1 || _currentPage == 2)
         {
+            var appDataDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "GPhotosSync");
+
+            var validation = ValidateInstallationPaths(_txtInstallDir.Text, _txtPhotosFolder.Text, appDataDir);
+            if (!validation.IsValid)
+            {
+                MessageBox.Show(
+                    this,
+                    validation.ErrorMessage,
+                    "Nepovolená kombinace složek",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
             ShowPage(2);
-            await PerformInstallationAsync();
-            ShowPage(3);
+            if (await PerformInstallationAsync())
+            {
+                ShowPage(3);
+            }
         }
         else if (_currentPage == 3)
         {
@@ -413,12 +486,20 @@ public class InstallerForm : Form
         }
     }
 
-    private async Task PerformInstallationAsync()
+    private async Task<bool> PerformInstallationAsync()
     {
         try
         {
-            var installDir = _txtInstallDir.Text.Trim();
-            var photosDir = _txtPhotosFolder.Text.Trim();
+            _lblProgressStatus.ForeColor = SystemColors.ControlText;
+            var installDir = Path.GetFullPath(_txtInstallDir.Text.Trim());
+            var photosDir = Path.GetFullPath(_txtPhotosFolder.Text.Trim());
+            var appDataDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "GPhotosSync");
+
+            var pathCheck = ValidateInstallationPaths(installDir, photosDir, appDataDir);
+            if (!pathCheck.IsValid)
+                throw new InvalidOperationException(pathCheck.ErrorMessage);
 
             // Stop any running instance of GPhotosSync before overwriting files
             _lblProgressStatus.Text = "Ukončuji případné běžící instance aplikace...";
@@ -464,9 +545,6 @@ public class InstallerForm : Form
                 : _rbLast30Days.Checked ? "last_30_days"
                 : "all";
 
-            var appDataDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "GPhotosSync");
             Directory.CreateDirectory(appDataDir);
 
             var defaultsObj = new
@@ -518,14 +596,24 @@ public class InstallerForm : Form
             _lblProgressStatus.Text = "Instalace dokončena.";
             _progressBar.Value = 100;
             await Task.Delay(400);
+            return true;
         }
         catch (Exception ex)
         {
+            _lblProgressStatus.Text = $"Instalace selhala: {ex.Message}";
+            _lblProgressStatus.ForeColor = Color.FromArgb(190, 35, 35);
+            // Bod 14: Povolit návrat tlačítkem Zpět i přímé opakování tlačítkem Instalovat
+            _btnBack.Enabled = true;
+            _btnNext.Enabled = true;
+            _btnNext.Text = "Zkusit znovu";
+            _btnCancel.Enabled = true;
+
             MessageBox.Show(
                 $"Během instalace došlo k chybě:\n{ex.Message}",
                 "Chyba instalace",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
+            return false;
         }
     }
 

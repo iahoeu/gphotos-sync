@@ -3,6 +3,7 @@ bin/
 obj/
 artifacts/
 src/GPhotosSync.Installer/payload.zip
+GPhotosSync_Setup.exe
 _migrace_chatu/
 .gitea_token
 

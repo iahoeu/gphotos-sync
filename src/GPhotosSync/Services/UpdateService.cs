@@ -19,7 +19,10 @@ public class UpdateCheckResult
 public class UpdateService
 {
     private readonly AppConfig _config;
-    private static readonly HttpClient Http = new()
+    private static readonly HttpClient Http = new(new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false
+    })
     {
         Timeout = TimeSpan.FromSeconds(30)
     };
@@ -39,6 +42,102 @@ public class UpdateService
         !string.IsNullOrWhiteSpace(_config.GiteaRepoOwner) &&
         !string.IsNullOrWhiteSpace(_config.GiteaRepoName);
 
+    /// <summary>
+    /// Ověří, že URL pro aktualizaci používá výhradně protokol HTTPS a směřuje na nakonfigurovaný Gitea server (P2-13).
+    /// </summary>
+    public static bool IsAllowedUpdateUrl(string? candidateUrl, string? configuredGiteaServerUrl)
+    {
+        if (string.IsNullOrWhiteSpace(candidateUrl) || string.IsNullOrWhiteSpace(configuredGiteaServerUrl))
+            return false;
+
+        if (!Uri.TryCreate(configuredGiteaServerUrl.Trim(), UriKind.Absolute, out var baseUri) ||
+            !string.Equals(baseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!Uri.TryCreate(candidateUrl.Trim(), UriKind.Absolute, out var candidateUri) ||
+            !string.Equals(candidateUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return string.Equals(candidateUri.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase) &&
+               candidateUri.Port == baseUri.Port;
+    }
+
+    /// <summary>
+    /// Vybere URL instalátoru z pole assets v Gitea release odpovědi a ověří, že splňuje bezpečnostní pravidla (P2-13).
+    /// </summary>
+    public static string SelectInstallerAssetUrl(JsonElement assetsArray, string? configuredGiteaServerUrl)
+    {
+        if (assetsArray.ValueKind != JsonValueKind.Array)
+            return string.Empty;
+
+        string fallbackExeUrl = string.Empty;
+
+        foreach (var asset in assetsArray.EnumerateArray())
+        {
+            var name = asset.TryGetProperty("name", out var nProp) ? nProp.GetString() ?? "" : "";
+            var url = asset.TryGetProperty("browser_download_url", out var uProp) ? uProp.GetString() ?? "" : "";
+
+            if (!name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(url))
+                continue;
+
+            if (!IsAllowedUpdateUrl(url, configuredGiteaServerUrl))
+                continue;
+
+            if (name.Contains("Setup", StringComparison.OrdinalIgnoreCase))
+                return url;
+
+            if (string.IsNullOrEmpty(fallbackExeUrl))
+                fallbackExeUrl = url;
+        }
+
+        return fallbackExeUrl;
+    }
+
+    private async Task<HttpResponseMessage> SendWithSafeRedirectAsync(
+        string initialUrl,
+        string? userAgentVersion,
+        HttpCompletionOption completionOption,
+        CancellationToken ct)
+    {
+        string currentUrl = initialUrl;
+        const int maxRedirects = 5;
+
+        for (int i = 0; i <= maxRedirects; i++)
+        {
+            if (!IsAllowedUpdateUrl(currentUrl, _config.GiteaServerUrl))
+            {
+                throw new InvalidOperationException(
+                    $"Nepovolená URL pro aktualizaci: '{currentUrl}'. Povoleno je pouze HTTPS na nakonfigurovaném Gitea serveru.");
+            }
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, currentUrl);
+            if (!string.IsNullOrWhiteSpace(userAgentVersion))
+            {
+                req.Headers.UserAgent.Add(new ProductInfoHeaderValue("GPhotosSync", userAgentVersion));
+            }
+
+            var resp = await Http.SendAsync(req, completionOption, ct);
+            int status = (int)resp.StatusCode;
+            if (status is 301 or 302 or 303 or 307 or 308 && resp.Headers.Location != null)
+            {
+                var nextUri = resp.Headers.Location.IsAbsoluteUri
+                    ? resp.Headers.Location
+                    : new Uri(new Uri(currentUrl), resp.Headers.Location);
+                resp.Dispose();
+                currentUrl = nextUri.ToString();
+                continue;
+            }
+
+            return resp;
+        }
+
+        throw new InvalidOperationException("Příliš mnoho přesměrování při komunikaci s Gitea serverem.");
+    }
+
     public async Task<UpdateCheckResult> CheckForUpdatesAsync(CancellationToken ct = default)
     {
         var currentVer = GetCurrentVersion();
@@ -57,19 +156,22 @@ public class UpdateService
         try
         {
             var baseUrl = _config.GiteaServerUrl.Trim().TrimEnd('/');
+            if (!IsAllowedUpdateUrl(baseUrl, _config.GiteaServerUrl))
+            {
+                return new UpdateCheckResult
+                {
+                    IsUpdateAvailable = false,
+                    CurrentVersion = currentVerStr,
+                    ErrorMessage = "URL Gitea serveru musí začínat na https://."
+                };
+            }
+
             var owner = _config.GiteaRepoOwner.Trim();
             var repo = _config.GiteaRepoName.Trim();
 
             var apiUrl = $"{baseUrl}/api/v1/repos/{owner}/{repo}/releases/latest";
 
-            using var req = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-            req.Headers.UserAgent.Add(new ProductInfoHeaderValue("GPhotosSync", currentVerStr));
-            if (!string.IsNullOrWhiteSpace(_config.GiteaAccessToken))
-            {
-                req.Headers.Authorization = new AuthenticationHeaderValue("token", _config.GiteaAccessToken.Trim());
-            }
-
-            using var resp = await Http.SendAsync(req, ct);
+            using var resp = await SendWithSafeRedirectAsync(apiUrl, currentVerStr, HttpCompletionOption.ResponseContentRead, ct);
             if (!resp.IsSuccessStatusCode)
             {
                 return new UpdateCheckResult
@@ -101,21 +203,21 @@ public class UpdateService
             string downloadUrl = "";
             if (root.TryGetProperty("assets", out var assetsProp) && assetsProp.ValueKind == JsonValueKind.Array)
             {
-                foreach (var asset in assetsProp.EnumerateArray())
-                {
-                    var name = asset.TryGetProperty("name", out var nProp) ? nProp.GetString() ?? "" : "";
-                    var url = asset.TryGetProperty("browser_download_url", out var uProp) ? uProp.GetString() ?? "" : "";
-
-                    if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(url))
-                    {
-                        downloadUrl = url;
-                        if (name.Contains("Setup", StringComparison.OrdinalIgnoreCase))
-                            break;
-                    }
-                }
+                downloadUrl = SelectInstallerAssetUrl(assetsProp, _config.GiteaServerUrl);
             }
 
             bool isNewer = latestVer > new Version(currentVer.Major, currentVer.Minor, Math.Max(0, currentVer.Build));
+
+            if (isNewer && string.IsNullOrWhiteSpace(downloadUrl))
+            {
+                return new UpdateCheckResult
+                {
+                    IsUpdateAvailable = false,
+                    CurrentVersion = currentVerStr,
+                    LatestVersion = $"{latestVer.Major}.{latestVer.Minor}.{Math.Max(0, latestVer.Build)}",
+                    ErrorMessage = "Byla nalezena nová verze, ale neobsahuje platný instalátor na povolené HTTPS doméně Gitea serveru."
+                };
+            }
 
             return new UpdateCheckResult
             {
@@ -142,15 +244,18 @@ public class UpdateService
     {
         try
         {
-            Logger.Info($"Stahuji novou verzi instalátoru z Gitea: {downloadUrl}");
-
-            using var req = new HttpRequestMessage(HttpMethod.Get, downloadUrl);
-            if (!string.IsNullOrWhiteSpace(_config.GiteaAccessToken))
+            if (!IsAllowedUpdateUrl(downloadUrl, _config.GiteaServerUrl))
             {
-                req.Headers.Authorization = new AuthenticationHeaderValue("token", _config.GiteaAccessToken.Trim());
+                Logger.Error($"Aktualizace zablokována: URL '{downloadUrl}' není na povoleném HTTPS Gitea serveru.");
+                return false;
             }
 
-            using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+            Logger.Info($"Stahuji novou verzi instalátoru z Gitea: {downloadUrl}");
+
+            var currentVer = GetCurrentVersion();
+            var currentVerStr = $"{currentVer.Major}.{currentVer.Minor}.{Math.Max(0, currentVer.Build)}";
+
+            using var resp = await SendWithSafeRedirectAsync(downloadUrl, currentVerStr, HttpCompletionOption.ResponseHeadersRead, ct);
             resp.EnsureSuccessStatusCode();
 
             var tempUpdateExe = Path.Combine(Path.GetTempPath(), $"GPhotosSync_Update_{Guid.NewGuid():N}.exe");

@@ -7,6 +7,7 @@ public class SetupWizardForm : Form
 {
     private readonly AppConfig _config;
     private readonly GooglePhotosEngine _photosEngine;
+    private readonly SyncDatabase? _db;
 
     private readonly Label _lblAccountStatus;
     private readonly Button _btnLogin;
@@ -22,10 +23,11 @@ public class SetupWizardForm : Form
     private readonly DateTimePicker _dtpFromDate;
     private readonly RadioButton _rbAllHistory;
 
-    public SetupWizardForm(AppConfig config, GooglePhotosEngine photosEngine)
+    public SetupWizardForm(AppConfig config, GooglePhotosEngine photosEngine, SyncDatabase? db = null)
     {
         _config = config;
         _photosEngine = photosEngine;
+        _db = db;
 
         Text = "Průvodce nastavením – Google Photos Sync";
         Width = 680;
@@ -286,29 +288,45 @@ public class SetupWizardForm : Form
         Shown += async (_, _) => await RefreshLoginStatusAsync();
     }
 
-    private async Task RefreshLoginStatusAsync()
+    private async Task RefreshLoginStatusAsync(bool offerManualEmailPromptIfMissing = false)
     {
-        if (_photosEngine.IsKnownLoggedIn)
-        {
-            _lblAccountStatus.Text = "✓ Účet Google Photos je připojen a připraven.";
-            _lblAccountStatus.ForeColor = Color.FromArgb(20, 135, 55);
-            _btnLogin.Text = "Změnit účet Google...";
-            return;
-        }
-
         _lblAccountStatus.Text = "Ověřuji přihlášení ke Google Photos...";
         _lblAccountStatus.ForeColor = Color.DimGray;
 
-        bool loggedIn = await _photosEngine.CheckLoggedInAsync();
-        if (loggedIn || _photosEngine.IsKnownLoggedIn)
+        var check = await _photosEngine.CheckLoginAndAccountAsync(_config.ExpectedGoogleAccountEmail);
+        if (check.IsLoggedIn)
         {
-            _lblAccountStatus.Text = "✓ Účet Google Photos je připojen a připraven.";
-            _lblAccountStatus.ForeColor = Color.FromArgb(20, 135, 55);
+            if (string.IsNullOrWhiteSpace(_config.ExpectedGoogleAccountEmail) &&
+                !string.IsNullOrWhiteSpace(check.DetectedEmail))
+            {
+                _config.ExpectedGoogleAccountEmail = check.DetectedEmail;
+            }
+            else if (offerManualEmailPromptIfMissing &&
+                     string.IsNullOrWhiteSpace(check.DetectedEmail) &&
+                     string.IsNullOrWhiteSpace(_config.ExpectedGoogleAccountEmail))
+            {
+                SettingsForm.PromptManualGoogleAccountConfirmation(this, _config, null, _photosEngine);
+            }
+
+            var effectiveEmail = !string.IsNullOrWhiteSpace(check.DetectedEmail)
+                ? check.DetectedEmail
+                : _config.ExpectedGoogleAccountEmail;
+
+            if (!string.IsNullOrWhiteSpace(effectiveEmail))
+            {
+                _lblAccountStatus.Text = $"✓ Účet Google Photos je připojen a ověřen ({effectiveEmail}).";
+                _lblAccountStatus.ForeColor = Color.FromArgb(20, 135, 55);
+            }
+            else
+            {
+                _lblAccountStatus.Text = "✓ Přihlášeno (e-mail neověřen – stahování poběží, mazání vypnuto).";
+                _lblAccountStatus.ForeColor = Color.FromArgb(195, 110, 15);
+            }
             _btnLogin.Text = "Změnit účet Google...";
         }
         else
         {
-            _lblAccountStatus.Text = "⚠ Zatím nejste přihlášeni. Klikněte na tlačítko vpravo ->";
+            _lblAccountStatus.Text = check.ErrorMessage ?? "⚠ Zatím nejste přihlášeni. Klikněte na tlačítko vpravo ->";
             _lblAccountStatus.ForeColor = Color.FromArgb(195, 75, 15);
             _btnLogin.Text = "Přihlásit účet Google...";
         }
@@ -320,20 +338,19 @@ public class SetupWizardForm : Form
         loginForm.ShowDialog(this);
         if (loginForm.LoginSucceeded)
         {
-            _photosEngine.IsKnownLoggedIn = true;
+            // Uživatel vědomě mění/přihlašuje účet -> uvolnit předchozí vazbu na e-mail a načíst/potvrdit nový
+            _config.ExpectedGoogleAccountEmail = string.Empty;
         }
-        await RefreshLoginStatusAsync();
+        await RefreshLoginStatusAsync(offerManualEmailPromptIfMissing: loginForm.LoginSucceeded);
     }
 
     private void OnFinishClicked(object? sender, EventArgs e)
     {
-        if (string.IsNullOrWhiteSpace(_txtFolder.Text))
+        if (!SettingsForm.ApplyFolderChangeSafely(this, _config, _db, _txtFolder.Text))
         {
-            MessageBox.Show("Vyberte prosím cílovou složku pro stahování fotek.", "Chybí složka", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
-        _config.DownloadFolder = _txtFolder.Text.Trim();
         _config.DownloadVideos = _chkVideos.Checked;
         _config.TwoWayDelete = _chkTwoWayDelete.Checked;
         _config.StartWithWindows = _chkAutoStart.Checked;
@@ -360,7 +377,14 @@ public class SetupWizardForm : Form
         }
 
         _config.IsFirstRunCompleted = true;
-        _config.Save();
+        if (_config.HasConfigLoadError)
+        {
+            _config.ClearConfigErrorAndSave();
+        }
+        else
+        {
+            _config.Save();
+        }
 
         StartupManager.SetStartWithWindows(_config.StartWithWindows);
 

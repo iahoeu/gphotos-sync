@@ -134,10 +134,23 @@ public class SettingsForm : Form
             Location = new Point(445, 23),
             Size = new Size(168, 30)
         };
-        btnAccount.Click += (_, _) =>
+        btnAccount.Click += async (_, _) =>
         {
             using var loginForm = new GoogleLoginForm(_syncEngine.PhotosEngine);
             loginForm.ShowDialog(this);
+            if (loginForm.LoginSucceeded)
+            {
+                _config.ExpectedGoogleAccountEmail = string.Empty;
+                var check = await _syncEngine.PhotosEngine.CheckLoginAndAccountAsync();
+                if (!string.IsNullOrWhiteSpace(check.DetectedEmail))
+                {
+                    _syncEngine.ConfirmGoogleAccountEmailManually(check.DetectedEmail);
+                }
+                else
+                {
+                    PromptManualGoogleAccountConfirmation(this, _config, _syncEngine, _syncEngine.PhotosEngine);
+                }
+            }
         };
 
         _chkVideos = new CheckBox
@@ -280,6 +293,48 @@ public class SettingsForm : Form
             ForeColor = Color.FromArgb(40, 80, 140)
         };
 
+        // Bod 3 & 12: Tlačítko pro obnovu konfigurace ze zálohy config.json.bak, pokud je config poškozen nebo chybí
+        if (_config.HasConfigLoadError && AppConfig.HasBackupFile())
+        {
+            var btnRestoreBak = new Button
+            {
+                Text = "Obnovit config.json.bak",
+                Location = new Point(445, 16),
+                Size = new Size(168, 26),
+                BackColor = Color.FromArgb(230, 126, 34),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat
+            };
+            btnRestoreBak.FlatAppearance.BorderSize = 0;
+            btnRestoreBak.Click += async (_, _) =>
+            {
+                await _syncEngine.StopAndWaitForIdleAsync();
+                if (_config.TryRestoreFromBackup(out var err))
+                {
+                    _txtFolder.Text = _config.DownloadFolder;
+                    _numInterval.Value = Math.Clamp(_config.SyncIntervalMinutes, 1, 720);
+                    _chkVideos.Checked = _config.DownloadVideos;
+                    _chkTwoWayDelete.Checked = _config.TwoWayDelete;
+                    _chkStartWithWindows.Checked = _config.StartWithWindows;
+                    _chkNotifications.Checked = _config.ShowNotifications;
+                    _txtGiteaUrl.Text = _config.GiteaServerUrl;
+                    _txtGiteaOwner.Text = _config.GiteaRepoOwner;
+                    _txtGiteaRepo.Text = _config.GiteaRepoName;
+                    _txtGiteaToken.Text = _config.GiteaAccessToken;
+                    _chkAutoCheckUpdates.Checked = _config.AutoCheckUpdates;
+                    _chkAutoInstallUpdates.Checked = _config.AutoInstallUpdates;
+                    _syncEngine.UpdateConfiguration();
+                    btnRestoreBak.Visible = false;
+                    MessageBox.Show(this, "Konfigurace byla úspěšně obnovena ze záložního souboru config.json.bak.", "Obnova dokončena", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    MessageBox.Show(this, err ?? "Obnova ze zálohy se nezdařila.", "Chyba obnovy", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            };
+            grpLogs.Controls.Add(btnRestoreBak);
+        }
+
         _txtLogs = new TextBox
         {
             Multiline = true,
@@ -303,7 +358,8 @@ public class SettingsForm : Form
         };
         btnWizard.Click += async (_, _) =>
         {
-            using var wiz = new SetupWizardForm(_config, _syncEngine.PhotosEngine);
+            await _syncEngine.StopAndWaitForIdleAsync();
+            using var wiz = new SetupWizardForm(_config, _syncEngine.PhotosEngine, _syncEngine.Database);
             if (wiz.ShowDialog(this) == DialogResult.OK)
             {
                 _txtFolder.Text = _config.DownloadFolder;
@@ -311,9 +367,11 @@ public class SettingsForm : Form
                 _chkTwoWayDelete.Checked = _config.TwoWayDelete;
                 _chkStartWithWindows.Checked = _config.StartWithWindows;
                 _syncEngine.Database.ClearSkippedInitialItems();
+                if (_config.DownloadVideos)
+                {
+                    _syncEngine.Database.ClearSkippedVideos();
+                }
                 _syncEngine.UpdateConfiguration();
-                _syncEngine.CancelCurrentSync();
-                await Task.Delay(300);
                 await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
             }
         };
@@ -363,9 +421,103 @@ public class SettingsForm : Form
         FormClosed += (_, _) => Logger.OnLogAdded -= OnNewLogLine;
     }
 
+    /// <summary>
+    /// Bod 8 + Doplněk: Když e-mail ze stránky Google Photos zjistit nejde, nabídne uživateli
+    /// ruční potvrzení a uložení e-mailu přihlášeného účtu Google, aby mohlo fungovat mazání.
+    /// </summary>
+    public static bool PromptManualGoogleAccountConfirmation(
+        IWin32Window? owner,
+        AppConfig config,
+        SyncEngine? syncEngine,
+        GooglePhotosEngine photosEngine)
+    {
+        using var dlg = new Form
+        {
+            Text = "Potvrzení účtu Google Photos pro obousměrné mazání",
+            Width = 500,
+            Height = 250,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            StartPosition = FormStartPosition.CenterParent,
+            Font = new Font("Segoe UI", 9.5f),
+            BackColor = Color.White
+        };
+
+        var lblInfo = new Label
+        {
+            Text = "Přihlášení ke Google Photos proběhlo, ale ze stránky se nepodařilo automaticky přečíst e-mail účtu.\r\n\r\n" +
+                   "Pro povolení obousměrného mazání zadejte a potvrďte e-mailovou adresu účtu Google, ke kterému jste přihlášeni (pokud nevyplníte, stahování poběží, ale mazání zůstane vypnuté):",
+            Location = new Point(18, 16),
+            Size = new Size(450, 90)
+        };
+
+        var txtEmail = new TextBox
+        {
+            Text = config.ExpectedGoogleAccountEmail ?? string.Empty,
+            PlaceholderText = "vas.ucet@gmail.com",
+            Location = new Point(18, 112),
+            Size = new Size(448, 28)
+        };
+
+        var btnConfirm = new Button
+        {
+            Text = "Potvrdit a uložit účet",
+            Location = new Point(180, 156),
+            Size = new Size(165, 34),
+            BackColor = Color.FromArgb(24, 138, 66),
+            ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat
+        };
+        btnConfirm.FlatAppearance.BorderSize = 0;
+
+        var btnSkip = new Button
+        {
+            Text = "Ponechat mazání vypnuté",
+            Location = new Point(352, 156),
+            Size = new Size(114, 34),
+            DialogResult = DialogResult.Cancel
+        };
+
+        btnConfirm.Click += (_, _) =>
+        {
+            var email = txtEmail.Text.Trim();
+            if (string.IsNullOrWhiteSpace(email) || !email.Contains('@') || !email.Contains('.'))
+            {
+                MessageBox.Show(dlg, "Zadejte prosím platnou e-mailovou adresu účtu Google.", "Neplatný e-mail", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (syncEngine != null)
+            {
+                syncEngine.ConfirmGoogleAccountEmailManually(email);
+            }
+            else
+            {
+                config.ExpectedGoogleAccountEmail = email;
+                photosEngine.ConfirmCurrentSessionAccountEmail(email);
+                config.Save();
+            }
+
+            dlg.DialogResult = DialogResult.OK;
+            dlg.Close();
+        };
+
+        dlg.Controls.Add(lblInfo);
+        dlg.Controls.Add(txtEmail);
+        dlg.Controls.Add(btnConfirm);
+        dlg.Controls.Add(btnSkip);
+        dlg.AcceptButton = btnConfirm;
+        dlg.CancelButton = btnSkip;
+
+        return dlg.ShowDialog(owner) == DialogResult.OK;
+    }
+
     private async Task OnManualUpdateCheckAsync()
     {
-        SaveFieldsToConfig();
+        if (!await SaveFieldsToConfigAsync())
+            return;
+
         var res = await _updateService.CheckForUpdatesAsync();
         if (!string.IsNullOrWhiteSpace(res.ErrorMessage))
         {
@@ -385,7 +537,7 @@ public class SettingsForm : Form
 
         var ask = MessageBox.Show(
             $"Na vašem Gitea serveru je k dispozici nová verze {res.LatestVersion} (vaše verze: {res.CurrentVersion}).\r\n\r\n" +
-            $" změny:\r\n{res.ReleaseNotes}\r\n\r\nChcete novou verzi nyní automaticky stáhnout a nainstalovat?",
+            $"Změny:\r\n{res.ReleaseNotes}\r\n\r\nChcete novou verzi nyní automaticky stáhnout a nainstalovat?",
             "Dostupná aktualizace",
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Information);
@@ -414,9 +566,151 @@ public class SettingsForm : Form
         }
     }
 
-    private void SaveFieldsToConfig()
+    /// <summary>
+    /// P0-1: Bezpečné přepnutí cílové složky. Nikdy nevyvolá smazání dříve stažených fotek v Google Photos.
+    /// Uživatel si zvolí buď přesun souborů do nové složky, nebo přepojení evidence na novou složku.
+    /// </summary>
+    public static bool ApplyFolderChangeSafely(IWin32Window? owner, AppConfig config, SyncDatabase? db, string newFolderRaw)
     {
-        _config.DownloadFolder = _txtFolder.Text.Trim();
+        var newFolder = (newFolderRaw ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(newFolder))
+        {
+            MessageBox.Show(owner, "Vyberte prosím platnou cílovou složku.", "Chybí složka", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        var oldFolder = (config.DownloadFolder ?? "").Trim();
+        bool isSameFolder = false;
+        if (!string.IsNullOrWhiteSpace(oldFolder))
+        {
+            try
+            {
+                isSameFolder = string.Equals(
+                    Path.GetFullPath(oldFolder).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    Path.GetFullPath(newFolder).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                isSameFolder = string.Equals(oldFolder, newFolder, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        if (isSameFolder && !config.HasConfigLoadError)
+        {
+            if (string.IsNullOrWhiteSpace(config.FolderId))
+            {
+                config.InitializeFolderMarker(newFolder);
+            }
+            config.DownloadFolder = newFolder;
+            return true;
+        }
+
+        var downloadedItems = db?.GetItemsByStatus(SyncItemStatus.Downloaded) ?? [];
+        var pendingDeletes = db?.GetItemsByStatus(SyncItemStatus.PendingRemoteDelete) ?? [];
+        int totalTracked = downloadedItems.Count + pendingDeletes.Count;
+
+        // Pokud jde o stejnou složku při obnově configu, ověříme nebo připíšeme marker, pokud ve složce soubory existují
+        if (isSameFolder && config.HasConfigLoadError)
+        {
+            Directory.CreateDirectory(newFolder);
+            config.DownloadFolder = newFolder;
+            config.InitializeFolderMarker(newFolder);
+            return true;
+        }
+
+        if (totalTracked > 0 && db != null)
+        {
+            var choice = MessageBox.Show(
+                owner,
+                $"Změnili jste cílovou složku pro synchronizaci:\r\n" +
+                $"Původní: {oldFolder}\r\n" +
+                $"Nová: {newFolder}\r\n\r\n" +
+                $"V evidenci je {totalTracked} dříve stažených položek.\r\n\r\n" +
+                $"• Klikněte na ANO pro automatické PŘESUNUTÍ dříve stažených souborů ze staré složky do nové složky.\r\n" +
+                $"• Klikněte na NE pro PŘEPOJENÍ evidence na novou složku bez přesunu souborů (soubory ve staré složce zůstanou na svém místě a v Google Photos se NIC nesmaže).\r\n" +
+                $"• Klikněte na STORNO pro zrušení změny složky.",
+                "Změna cílové složky – ochrana před smazáním fotek",
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Question);
+
+            if (choice == DialogResult.Cancel)
+            {
+                return false;
+            }
+
+            Directory.CreateDirectory(newFolder);
+
+            if (choice == DialogResult.Yes)
+            {
+                int movedCount = 0;
+                db.RevertPendingRemoteDeletesToDownloaded();
+                foreach (var item in db.GetItemsByStatus(SyncItemStatus.Downloaded))
+                {
+                    if (string.IsNullOrWhiteSpace(item.LocalFileName)) continue;
+                    var srcPath = Path.Combine(oldFolder, item.LocalFileName);
+                    var dstPath = Path.Combine(newFolder, item.LocalFileName);
+                    try
+                    {
+                        if (File.Exists(srcPath))
+                        {
+                            var dstDir = Path.GetDirectoryName(dstPath);
+                            if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
+                            if (!File.Exists(dstPath))
+                            {
+                                File.Move(srcPath, dstPath);
+                                movedCount++;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"Nelze přesunout soubor '{item.LocalFileName}' do nové složky: {ex.Message}");
+                    }
+                }
+
+                // Pokud v původní složce některé soubory již nebyly, odpojíme je od mazání, aby změna složky nikdy nevyvolala mazání
+                foreach (var item in db.GetItemsByStatus(SyncItemStatus.Downloaded))
+                {
+                    var dstPath = Path.Combine(newFolder, item.LocalFileName);
+                    if (!File.Exists(dstPath))
+                    {
+                        db.UpdateStatus(item.MediaKey, SyncItemStatus.SkippedInitial, SkipReason.FolderUnlinked);
+                    }
+                }
+
+                config.DownloadFolder = newFolder;
+                config.InitializeFolderMarker(newFolder, generateNewId: true);
+                Logger.Info($"Cílová složka změněna na '{newFolder}' (přesunuto {movedCount} souborů).");
+                return true;
+            }
+            else
+            {
+                int unlinked = db.UnlinkDownloadedItemsFromDeletion();
+                config.DownloadFolder = newFolder;
+                config.InitializeFolderMarker(newFolder, generateNewId: true);
+                Logger.Info($"Cílová složka změněna na '{newFolder}' (evidence {unlinked} starších položek byla bezpečně odpojena od mazání).");
+                return true;
+            }
+        }
+
+        config.DownloadFolder = newFolder;
+        config.InitializeFolderMarker(newFolder, generateNewId: true);
+        return true;
+    }
+
+    private async Task<bool> SaveFieldsToConfigAsync()
+    {
+        bool videosNewlyEnabled = !_config.DownloadVideos && _chkVideos.Checked;
+
+        // Bod 4: Před uložením změny složky vždy zrušit a počkat na doběhnutí synchronizace i mazání
+        await _syncEngine.StopAndWaitForIdleAsync();
+
+        if (!ApplyFolderChangeSafely(this, _config, _syncEngine.Database, _txtFolder.Text))
+        {
+            return false;
+        }
+
         _config.SyncIntervalMinutes = (int)_numInterval.Value;
         _config.DownloadVideos = _chkVideos.Checked;
         _config.TwoWayDelete = _chkTwoWayDelete.Checked;
@@ -429,16 +723,46 @@ public class SettingsForm : Form
         _config.GiteaAccessToken = _txtGiteaToken.Text.Trim();
         _config.AutoCheckUpdates = _chkAutoCheckUpdates.Checked;
         _config.AutoInstallUpdates = _chkAutoInstallUpdates.Checked;
-        _config.Save();
+        _config.IsFirstRunCompleted = true;
+
+        // Bod 12: Umožnit uživateli po ověření/potvrzení složky přímo v aplikaci odblokovat chybový stav configu
+        if (_config.HasConfigLoadError)
+        {
+            _config.ClearConfigErrorAndSave();
+        }
+        else
+        {
+            _config.Save();
+        }
+
+        // P1-12: Pokud uživatel zapnul stahování videí v Nastavení, uvolníme dříve přeskočená videa
+        if (videosNewlyEnabled)
+        {
+            int freedVideos = _syncEngine.Database.ClearSkippedVideos();
+            if (freedVideos > 0)
+            {
+                Logger.Info($"Zapnuto stahování videí – uvolněno {freedVideos} dříve přeskočených videí ke stažení.");
+            }
+        }
+
+        return true;
     }
 
-    private void OnSaveClicked(object? sender, EventArgs e)
+    private async void OnSaveClicked(object? sender, EventArgs e)
     {
-        SaveFieldsToConfig();
+        bool videosNewlyEnabled = !_config.DownloadVideos && _chkVideos.Checked;
+        if (!await SaveFieldsToConfigAsync())
+            return;
+
         StartupManager.SetStartWithWindows(_config.StartWithWindows);
         _syncEngine.UpdateConfiguration();
 
         DialogResult = DialogResult.OK;
         Close();
+
+        if (videosNewlyEnabled)
+        {
+            await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
+        }
     }
 }
