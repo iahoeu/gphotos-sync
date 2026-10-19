@@ -224,6 +224,8 @@ public class GooglePhotosEngine : IDisposable
 
     public void ShowDiagnosticBrowserWindow()
     {
+        // V zobrazeném prohlížeči lze přepnout účet -> dřívější ruční potvrzení e-mailu už neplatí
+        _manuallyConfirmedSessionEmail = null;
         _hostForm.ShowOnScreenForDiagnostics();
     }
 
@@ -722,8 +724,19 @@ public class GooglePhotosEngine : IDisposable
             string? lastScannedKey = null;
             DateTime? oldestScannedDate = null;
 
-            for (int step = 0; step < maxScrollStepsLimit; step++)
+            // Kroky potřebné k dosažení místa, kde minulý sken skončil (resumeAfterMediaKey), se nepočítají
+            // do limitu skenu – jinak by se kurzor nikdy nedostal hlouběji než na první limit.
+            const int maxResumeSeekSteps = 600;
+            var maxResumeSeekDuration = TimeSpan.FromMinutes(5);
+            var seekStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            int scanSteps = 0;
+
+            for (int step = 0; scanSteps < maxScrollStepsLimit && step < maxScrollStepsLimit + maxResumeSeekSteps; step++)
             {
+                // Posun k místu minulého skenu drží zámek prohlížeče (blokuje mazání i stahování) -> omezit i časem
+                if (!passedResumeKey && seekStopwatch.Elapsed > maxResumeSeekDuration)
+                    break;
+
                 ct.ThrowIfCancellationRequested();
 
                 var extracted = await ExtractPhotoAnchorsFromDomAsync();
@@ -772,7 +785,12 @@ public class GooglePhotosEngine : IDisposable
                     }
                 }
 
-                Logger.Info($"Skenování časové osy (krok {step + 1}): doposud nalezeno {itemsById.Count} položek (+{newlyAddedInStep} v tomto kroku).");
+                if (passedResumeKey)
+                {
+                    scanSteps++;
+                }
+
+                Logger.Info($"Skenování časové osy (krok {step + 1}{(passedResumeKey ? "" : ", posun k místu minulého skenu")}): doposud nalezeno {itemsById.Count} položek (+{newlyAddedInStep} v tomto kroku).");
 
                 if (newlyAddedInStep == 0)
                 {
@@ -792,7 +810,7 @@ public class GooglePhotosEngine : IDisposable
                 }
 
                 // P1-9: Zastavit posouvání, jakmile jsme v běžném režimu (po překonání případného resume bodu) narazili na souvislou vrstvu již známých/starších položek
-                if (!scanAllHistory && passedResumeKey && step + 1 >= minStepsBeforeEarlyStop && consecutiveStepsAllKnownOrOlder >= 2)
+                if (!scanAllHistory && passedResumeKey && scanSteps >= minStepsBeforeEarlyStop && consecutiveStepsAllKnownOrOlder >= 2)
                 {
                     reachedBoundary = true;
                     break;
@@ -815,10 +833,15 @@ public class GooglePhotosEngine : IDisposable
                     }
                 }
 
-                if (step < maxScrollStepsLimit - 1)
+                if (scanSteps < maxScrollStepsLimit)
                 {
                     await ScrollTimelineStepAsync(ct);
                 }
+            }
+
+            if (!passedResumeKey && !reachedBoundary)
+            {
+                Logger.Warn("Místo, kde skončil minulý sken časové osy, se nepodařilo v limitu dosáhnout – další cyklus naváže od nejhlubší dosažené položky.");
             }
 
             if (itemsById.Count == 0)

@@ -206,46 +206,53 @@ public static class Program
 
         var photosDir = TryReadConfiguredPhotosFolder(appDataDir);
 
-        // Bod 2: Mazání %LocalAppData%\GPhotosSync nesmí nikdy zasáhnout složku fotek
-        if (!string.IsNullOrWhiteSpace(photosDir) && ArePathsOverlapping(appDataDir, photosDir))
+        // Bod 2: Mazání %LocalAppData%\GPhotosSync nesmí nikdy zasáhnout složku fotek. Umístění fotek nemusí
+        // být známé (chybějící nebo poškozený config), proto se vždy mažou jen známé soubory dat aplikace
+        // a složka samotná jen tehdy, když po nich zůstane prázdná.
+        string[] knownAppDataFiles =
+        [
+            "config.json",
+            "config.json.bak",
+            "config.json.tmp",
+            "installer_defaults.json",
+            "sync_history.db",
+            "sync_history.db-wal",
+            "sync_history.db-shm",
+            "sync_history.db-journal",
+            "sync.log"
+        ];
+
+        foreach (var f in knownAppDataFiles)
         {
-            // Pokud by se složka fotek překrývala s %LocalAppData%\GPhotosSync, smažeme pouze známé soubory dat aplikace
-            string[] knownAppDataFiles =
-            [
-                "config.json",
-                "config.json.bak",
-                "config.json.tmp",
-                "installer_defaults.json",
-                "sync.db",
-                "sync.db-wal",
-                "sync.db-shm",
-                "sync.log",
-                "sync_old.log"
-            ];
+            var fp = Path.Combine(appDataDir, f);
+            try { if (File.Exists(fp)) File.Delete(fp); } catch { }
+        }
 
-            foreach (var f in knownAppDataFiles)
+        // Profil WebView2 (cookies přihlášení Google) vytváří výhradně aplikace
+        var webViewDir = Path.Combine(appDataDir, "WebViewProfile");
+        if (Directory.Exists(webViewDir) &&
+            (string.IsNullOrWhiteSpace(photosDir) || !ArePathsOverlapping(webViewDir, photosDir)))
+        {
+            try
             {
-                var fp = Path.Combine(appDataDir, f);
-                try { if (File.Exists(fp)) File.Delete(fp); } catch { }
+                Directory.Delete(webViewDir, recursive: true);
             }
-
-            var webViewDir = Path.Combine(appDataDir, "WebView2Session");
-            if (Directory.Exists(webViewDir) && !ArePathsOverlapping(webViewDir, photosDir))
+            catch
             {
+                // Podproces WebView2 může ještě krátce držet zámek
+                Thread.Sleep(500);
                 try { Directory.Delete(webViewDir, recursive: true); } catch { }
             }
-            return;
         }
 
         try
         {
-            Directory.Delete(appDataDir, recursive: true);
+            if (!Directory.EnumerateFileSystemEntries(appDataDir).Any())
+            {
+                Directory.Delete(appDataDir, recursive: false);
+            }
         }
-        catch
-        {
-            Thread.Sleep(500);
-            try { Directory.Delete(appDataDir, recursive: true); } catch { }
-        }
+        catch { }
     }
 
     private static void RunUninstaller()

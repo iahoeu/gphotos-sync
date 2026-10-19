@@ -309,6 +309,8 @@ public class SettingsForm : Form
             btnRestoreBak.Click += async (_, _) =>
             {
                 await _syncEngine.StopAndWaitForIdleAsync();
+                try
+                {
                 if (_config.TryRestoreFromBackup(out var err))
                 {
                     _txtFolder.Text = _config.DownloadFolder;
@@ -330,6 +332,11 @@ public class SettingsForm : Form
                 else
                 {
                     MessageBox.Show(this, err ?? "Obnova ze zálohy se nezdařila.", "Chyba obnovy", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                }
+                finally
+                {
+                    _syncEngine.UpdateConfiguration();
                 }
             };
             grpLogs.Controls.Add(btnRestoreBak);
@@ -360,7 +367,12 @@ public class SettingsForm : Form
         {
             await _syncEngine.StopAndWaitForIdleAsync();
             using var wiz = new SetupWizardForm(_config, _syncEngine.PhotosEngine, _syncEngine.Database);
-            if (wiz.ShowDialog(this) == DialogResult.OK)
+            if (wiz.ShowDialog(this) != DialogResult.OK)
+            {
+                // Zrušený průvodce: obnovit časovače zastavené před jeho otevřením
+                _syncEngine.UpdateConfiguration();
+            }
+            else
             {
                 _txtFolder.Text = _config.DownloadFolder;
                 _chkVideos.Checked = _config.DownloadVideos;
@@ -613,9 +625,48 @@ public class SettingsForm : Form
         // Pokud jde o stejnou složku při obnově configu, ověříme nebo připíšeme marker, pokud ve složce soubory existují
         if (isSameFolder && config.HasConfigLoadError)
         {
+            if (!Directory.Exists(newFolder) && totalTracked > 0)
+            {
+                MessageBox.Show(owner,
+                    $"Složka '{newFolder}' neexistuje, přestože evidence obsahuje {totalTracked} stažených položek.\r\n" +
+                    "Zkontrolujte připojení disku nebo zvolte složku, ve které jsou stažené fotky.",
+                    "Složka nenalezena", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+
             Directory.CreateDirectory(newFolder);
             config.DownloadFolder = newFolder;
             config.InitializeFolderMarker(newFolder);
+
+            // Složku přijmout jen tehdy, když prokazatelně patří k evidenci (shodná identita uložená v DB,
+            // nebo – pokud identita v DB ještě není – jsou v ní evidované soubory).
+            var storedFolderId = db?.GetState(SyncEngine.StateKeyFolderId);
+            bool anyTrackedOnDisk = downloadedItems.Any(i =>
+                !string.IsNullOrWhiteSpace(i.LocalFileName) && File.Exists(Path.Combine(newFolder, i.LocalFileName)));
+            bool belongsToEvidence = totalTracked == 0 ||
+                (string.IsNullOrWhiteSpace(storedFolderId)
+                    ? anyTrackedOnDisk
+                    : string.Equals(storedFolderId, config.FolderId, StringComparison.Ordinal));
+
+            if (!belongsToEvidence && db != null)
+            {
+                var unlinkChoice = MessageBox.Show(owner,
+                    $"Složka '{newFolder}' neodpovídá složce, ke které patří evidence {totalTracked} stažených položek.\r\n\r\n" +
+                    "• ANO = použít tuto složku a dosavadní evidenci odpojit od mazání (v Google Photos se NIC nesmaže).\r\n" +
+                    "• NE = zrušit a zvolit jinou složku.",
+                    "Složka neodpovídá evidenci",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+
+                if (unlinkChoice != DialogResult.Yes)
+                    return false;
+
+                int unlinked = db.UnlinkDownloadedItemsFromDeletion();
+                config.InitializeFolderMarker(newFolder, generateNewId: true);
+                Logger.Info($"Při obnově konfigurace byla zvolena složka '{newFolder}' mimo evidenci ({unlinked} položek odpojeno od mazání).");
+            }
+
+            db?.SetState(SyncEngine.StateKeyFolderId, config.FolderId);
             return true;
         }
 
@@ -681,6 +732,7 @@ public class SettingsForm : Form
 
                 config.DownloadFolder = newFolder;
                 config.InitializeFolderMarker(newFolder, generateNewId: true);
+                db.SetState(SyncEngine.StateKeyFolderId, config.FolderId);
                 Logger.Info($"Cílová složka změněna na '{newFolder}' (přesunuto {movedCount} souborů).");
                 return true;
             }
@@ -689,6 +741,7 @@ public class SettingsForm : Form
                 int unlinked = db.UnlinkDownloadedItemsFromDeletion();
                 config.DownloadFolder = newFolder;
                 config.InitializeFolderMarker(newFolder, generateNewId: true);
+                db.SetState(SyncEngine.StateKeyFolderId, config.FolderId);
                 Logger.Info($"Cílová složka změněna na '{newFolder}' (evidence {unlinked} starších položek byla bezpečně odpojena od mazání).");
                 return true;
             }
@@ -696,15 +749,28 @@ public class SettingsForm : Form
 
         config.DownloadFolder = newFolder;
         config.InitializeFolderMarker(newFolder, generateNewId: true);
+        db?.SetState(SyncEngine.StateKeyFolderId, config.FolderId);
         return true;
     }
 
     private async Task<bool> SaveFieldsToConfigAsync()
     {
-        bool videosNewlyEnabled = !_config.DownloadVideos && _chkVideos.Checked;
-
         // Bod 4: Před uložením změny složky vždy zrušit a počkat na doběhnutí synchronizace i mazání
         await _syncEngine.StopAndWaitForIdleAsync();
+        try
+        {
+            return SaveFieldsToConfigCore();
+        }
+        finally
+        {
+            // Časovače a sledování složky obnovit i při zrušení změny složky nebo chybě
+            _syncEngine.UpdateConfiguration();
+        }
+    }
+
+    private bool SaveFieldsToConfigCore()
+    {
+        bool videosNewlyEnabled = !_config.DownloadVideos && _chkVideos.Checked;
 
         if (!ApplyFolderChangeSafely(this, _config, _syncEngine.Database, _txtFolder.Text))
         {
