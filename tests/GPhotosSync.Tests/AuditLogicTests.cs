@@ -1117,4 +1117,37 @@ public class AuditLogicTests : IDisposable
         Assert.True(File.Exists(Path.Combine(dir, "B_01.jpg")));
         Assert.Equal("B_01.jpg", db.GetByMediaKey("AF1QipBurst_00000000")!.LocalFileName);
     }
+
+    [Fact]
+    public void MoveRemainingFolderContent_MovesUntrackedFilesAndSubfolders_KeepsMarkerAndExisting()
+    {
+        var oldDir = Path.Combine(_tempRoot, "MoveOld");
+        var newDir = Path.Combine(_tempRoot, "MoveNew");
+        Directory.CreateDirectory(Path.Combine(oldDir, "sub"));
+        Directory.CreateDirectory(newDir);
+        File.WriteAllText(Path.Combine(oldDir, "neevidovana.jpg"), "a");
+        File.WriteAllText(Path.Combine(oldDir, "sub", "v_podslozce.jpg"), "b");
+        File.WriteAllText(Path.Combine(oldDir, AppConfig.FolderMarkerFileName), "id");
+        File.WriteAllText(Path.Combine(oldDir, "kolize.jpg"), "old");
+        File.WriteAllText(Path.Combine(newDir, "kolize.jpg"), "new");
+
+        int moved = GPhotosSync.Forms.SettingsForm.MoveRemainingFolderContent(oldDir, newDir);
+
+        Assert.Equal(2, moved);
+        Assert.True(File.Exists(Path.Combine(newDir, "neevidovana.jpg")));
+        Assert.True(File.Exists(Path.Combine(newDir, "sub", "v_podslozce.jpg")));
+        Assert.True(File.Exists(Path.Combine(oldDir, AppConfig.FolderMarkerFileName)));
+        Assert.Equal("new", File.ReadAllText(Path.Combine(newDir, "kolize.jpg")));
+        Assert.True(File.Exists(Path.Combine(oldDir, "kolize.jpg")));
+    }
+
+    [Theory]
+    [InlineData(@"C:\Fotky", @"C:\Fotky\Nove", true)]
+    [InlineData(@"C:\Fotky\Nove", @"C:\Fotky", true)]
+    [InlineData(@"C:\Fotky", @"D:\Fotky", false)]
+    [InlineData(@"C:\Fotky", @"C:\Fotky2", false)]
+    public void FoldersAreNested_DetectsParentChild(string a, string b, bool expected)
+    {
+        Assert.Equal(expected, GPhotosSync.Forms.SettingsForm.FoldersAreNested(a, b));
+    }
 }

@@ -588,6 +588,65 @@ public class SettingsForm : Form
         }
     }
 
+    public static bool FoldersAreNested(string a, string b)
+    {
+        try
+        {
+            var fa = Path.GetFullPath(a).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var fb = Path.GetFullPath(b).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return !string.Equals(fa, fb, StringComparison.OrdinalIgnoreCase) &&
+                   (fa.StartsWith(fb, StringComparison.OrdinalIgnoreCase) || fb.StartsWith(fa, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Přesune veškerý zbývající obsah staré složky (včetně podsložek) do nové. Identifikační soubor složky
+    /// a rozpracovaná stahování (.part) zůstávají; soubor, který v nové složce už existuje, se nepřepisuje.
+    /// </summary>
+    public static int MoveRemainingFolderContent(string oldFolder, string newFolder)
+    {
+        if (string.IsNullOrWhiteSpace(oldFolder) || !Directory.Exists(oldFolder))
+            return 0;
+
+        int moved = 0;
+        int skipped = 0;
+        foreach (var src in Directory.EnumerateFiles(oldFolder, "*", SearchOption.AllDirectories).ToList())
+        {
+            var name = Path.GetFileName(src);
+            if (string.Equals(name, AppConfig.FolderMarkerFileName, StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith(".part", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var rel = Path.GetRelativePath(oldFolder, src);
+            var dst = Path.Combine(newFolder, rel);
+            try
+            {
+                if (File.Exists(dst))
+                {
+                    skipped++;
+                    continue;
+                }
+                var dstDir = Path.GetDirectoryName(dst);
+                if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
+                File.Move(src, dst);
+                moved++;
+            }
+            catch (Exception ex)
+            {
+                skipped++;
+                Logger.Warn($"Nelze přesunout soubor '{rel}' do nové složky: {ex.Message}");
+            }
+        }
+
+        if (skipped > 0)
+            Logger.Warn($"{skipped} souborů zůstalo v původní složce '{oldFolder}' (v nové složce už existují nebo je nešlo přesunout).");
+        return moved;
+    }
+
     /// <summary>
     /// P0-1: Bezpečné přepnutí cílové složky. Nikdy nevyvolá smazání dříve stažených fotek v Google Photos.
     /// Uživatel si zvolí buď přesun souborů do nové složky, nebo přepojení evidence na novou složku.
@@ -624,6 +683,14 @@ public class SettingsForm : Form
             {
                 isSameFolder = string.Equals(oldFolder, newFolder, StringComparison.OrdinalIgnoreCase);
             }
+        }
+
+        if (!isSameFolder && !string.IsNullOrWhiteSpace(oldFolder) && FoldersAreNested(oldFolder, newFolder))
+        {
+            MessageBox.Show(owner,
+                "Nová složka nesmí ležet uvnitř dosavadní složky ani ji obsahovat (přesun by se zacyklil a sledované soubory by se pletly).",
+                "Nepovolená složka", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
         }
 
         if (isSameFolder && !config.HasConfigLoadError)
@@ -711,7 +778,7 @@ public class SettingsForm : Form
                 $"Původní: {oldFolder}\r\n" +
                 $"Nová: {newFolder}\r\n\r\n" +
                 $"V evidenci je {totalTracked} dříve stažených položek.\r\n\r\n" +
-                $"• Klikněte na ANO pro automatické PŘESUNUTÍ dříve stažených souborů ze staré složky do nové složky.\r\n" +
+                $"• Klikněte na ANO pro automatické PŘESUNUTÍ celého obsahu staré složky (včetně podsložek) do nové složky.\r\n" +
                 $"• Klikněte na NE pro PŘEPOJENÍ evidence na novou složku bez přesunu souborů (soubory ve staré složce zůstanou na svém místě a v Google Photos se NIC nesmaže).\r\n" +
                 $"• Klikněte na STORNO pro zrušení změny složky.",
                 "Změna cílové složky – ochrana před smazáním fotek",
@@ -752,6 +819,9 @@ public class SettingsForm : Form
                         Logger.Warn($"Nelze přesunout soubor '{item.LocalFileName}' do nové složky: {ex.Message}");
                     }
                 }
+
+                // Přesunout i zbylý obsah staré složky (soubory mimo evidenci, např. po přeinstalaci se smazanou evidencí)
+                movedCount += MoveRemainingFolderContent(oldFolder, newFolder);
 
                 // Pokud v původní složce některé soubory již nebyly, odpojíme je od mazání, aby změna složky nikdy nevyvolala mazání
                 foreach (var item in db.GetItemsByStatus(SyncItemStatus.Downloaded))
