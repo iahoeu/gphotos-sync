@@ -206,6 +206,19 @@ public class SyncDatabase
         }
     }
 
+    public void ClearSkippedInitialItems()
+    {
+        lock (_dbLock)
+        {
+            using var conn = new SqliteConnection(_connectionString);
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM SyncItems WHERE Status = $status";
+            cmd.Parameters.AddWithValue("$status", (int)SyncItemStatus.SkippedInitial);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
     private static SyncItemRecord ReadRecord(SqliteDataReader reader)
     {
         return new SyncItemRecord

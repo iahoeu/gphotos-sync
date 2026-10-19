@@ -369,6 +369,27 @@ public class SyncEngine : IDisposable
             {
                 ct.ThrowIfCancellationRequested();
                 var item = newItems[i];
+
+                // Re-read cutoffDate dynamically in case user changed settings while a batch is downloading
+                cutoffDate = _config.InitialMode == InitialSyncMode.OnlyNewFromNow
+                    ? null
+                    : _config.GetCutoffDate();
+
+                if (cutoffDate.HasValue && item.EstimatedDate.HasValue && item.EstimatedDate.Value.Date < cutoffDate.Value.Date)
+                {
+                    Logger.Info($"Přeskakuji starší položku '{item.MediaKey}' podle nově upraveného nastavení ({item.EstimatedDate.Value:dd.MM.yyyy} < {cutoffDate.Value:dd.MM.yyyy}).");
+                    _db.UpsertItem(new SyncItemRecord
+                    {
+                        MediaKey = item.MediaKey,
+                        PhotoUrl = item.PhotoUrl,
+                        LocalFileName = string.Empty,
+                        TakenAt = item.EstimatedDate,
+                        UpdatedAt = DateTime.Now,
+                        Status = SyncItemStatus.SkippedInitial
+                    });
+                    continue;
+                }
+
                 RaiseStatus($"Stahuji ({i + 1}/{newItems.Count})...", isSyncing: true);
 
                 var res = await _photosEngine.DownloadMediaAsync(

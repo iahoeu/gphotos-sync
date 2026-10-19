@@ -301,7 +301,7 @@ public class SettingsForm : Form
             Location = new Point(18, 662),
             Size = new Size(155, 36)
         };
-        btnWizard.Click += (_, _) =>
+        btnWizard.Click += async (_, _) =>
         {
             using var wiz = new SetupWizardForm(_config, _syncEngine.PhotosEngine);
             if (wiz.ShowDialog(this) == DialogResult.OK)
@@ -310,7 +310,11 @@ public class SettingsForm : Form
                 _chkVideos.Checked = _config.DownloadVideos;
                 _chkTwoWayDelete.Checked = _config.TwoWayDelete;
                 _chkStartWithWindows.Checked = _config.StartWithWindows;
+                _syncEngine.Database.ClearSkippedInitialItems();
                 _syncEngine.UpdateConfiguration();
+                _syncEngine.CancelCurrentSync();
+                await Task.Delay(300);
+                await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
             }
         };
 
