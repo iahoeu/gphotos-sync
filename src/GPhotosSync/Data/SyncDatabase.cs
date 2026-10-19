@@ -17,7 +17,8 @@ public enum SkipReason
     Baseline = 1,
     CutoffDate = 2,
     VideoDisabled = 3,
-    FolderUnlinked = 4
+    FolderUnlinked = 4,
+    DeleteUnconfirmed = 5
 }
 
 public class SyncItemRecord

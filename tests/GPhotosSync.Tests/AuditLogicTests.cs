@@ -978,4 +978,48 @@ public class AuditLogicTests : IDisposable
         Assert.Equal(0, SyncEngine.BindEvidenceToAccount(db, "JanNovak@googlemail.com"));
         Assert.Equal(SyncItemStatus.Downloaded, db.GetByMediaKey("AF1QipAlias_00000000")!.Status);
     }
+
+    // -------------------------------------------------------------------------
+    // Test na VM: fotka obnovená z koše se nesmí znovu smazat a má se znovu stáhnout
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void IsReappearedAfterRemoteDelete_RestoredFromTrashIsDownloadedAgain()
+    {
+        var now = new DateTime(2026, 10, 19, 21, 0, 0);
+        var deleted = Record("AF1QipRestored_00000", "a.jpg", 4);
+        deleted.Status = SyncItemStatus.DeletedLocalAndRemote;
+        deleted.UpdatedAt = now.AddMinutes(-30);
+        Assert.True(SyncEngine.IsReappearedAfterRemoteDelete(deleted, now));
+
+        deleted.UpdatedAt = now.AddMinutes(-1); // hned po smazání se ještě nevyhodnocuje
+        Assert.False(SyncEngine.IsReappearedAfterRemoteDelete(deleted, now));
+
+        var unconfirmed = Record("AF1QipUnconfirmed_00", "b.jpg", 4);
+        unconfirmed.Status = SyncItemStatus.SkippedInitial;
+        unconfirmed.SkipReason = SkipReason.DeleteUnconfirmed;
+        unconfirmed.UpdatedAt = now.AddMinutes(-30);
+        Assert.True(SyncEngine.IsReappearedAfterRemoteDelete(unconfirmed, now));
+
+        var baseline = Record("AF1QipBaseline_00000", "", 0);
+        baseline.Status = SyncItemStatus.SkippedInitial;
+        baseline.SkipReason = SkipReason.Baseline;
+        baseline.UpdatedAt = now.AddDays(-3);
+        Assert.False(SyncEngine.IsReappearedAfterRemoteDelete(baseline, now));
+
+        var downloaded = Record("AF1QipDownloaded_000", "c.jpg", 4);
+        Assert.False(SyncEngine.IsReappearedAfterRemoteDelete(downloaded, now));
+    }
+
+    [Fact]
+    public void DeleteUnconfirmedItem_IsNotQueuedForDeletionAgain()
+    {
+        var (cfg, db, _) = CreateTwoWaySetup("NoRetryAfterClick");
+        db.UpsertItem(Record("AF1QipNoRetry_000000", "smazana.jpg", 4, Sha(new byte[] { 1, 2, 3, 4 })));
+        db.UpdateStatus("AF1QipNoRetry_000000", SyncItemStatus.SkippedInitial, SkipReason.DeleteUnconfirmed);
+
+        SyncEngine.DetectMissingLocalFilesForTwoWayDelete(cfg, db);
+
+        Assert.Empty(db.GetItemsByStatus(SyncItemStatus.PendingRemoteDelete));
+    }
 }

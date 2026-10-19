@@ -18,6 +18,17 @@ public class DiscoveredMediaItem
     public bool DiscoveredFromRecentlyAdded { get; set; }
 }
 
+/// <summary>
+/// Výsledek pokusu o přesun do koše. NotAttempted = na koš se vůbec nekliklo (lze bezpečně opakovat);
+/// Unconfirmed = kliknuto, ale výsledek nejde ověřit (NEOPAKOVAT – mohlo by to znovu smazat fotku obnovenou z koše).
+/// </summary>
+public enum TrashOutcome
+{
+    Trashed,
+    NotAttempted,
+    Unconfirmed
+}
+
 public enum TimelineScanDecision
 {
     Continue,
@@ -601,7 +612,7 @@ public class GooglePhotosEngine : IDisposable
 
             var currentUrl = _webView.CoreWebView2.Source ?? "";
             if (IsLoginOrMarketingUrl(currentUrl) ||
-                !currentUrl.Contains("/search/_tra_", StringComparison.OrdinalIgnoreCase))
+                !currentUrl.Contains("/search/", StringComparison.OrdinalIgnoreCase))
             {
                 return new TimelineScanResult
                 {
@@ -1482,12 +1493,13 @@ public class GooglePhotosEngine : IDisposable
     /// Úspěch smazání NIKDY nebere z pouhého opuštění URL: vyžaduje buď explicitní toast „Přesunuto do koše“,
     /// nebo následné ověření nedostupnosti položky při novém načtení její URL.
     /// </summary>
-    public async Task<bool> MoveToTrashAsync(string mediaKey, string photoUrl, CancellationToken ct = default)
+    public async Task<TrashOutcome> MoveToTrashAsync(string mediaKey, string photoUrl, CancellationToken ct = default)
     {
+        bool trashClicked = false;
         if (string.IsNullOrWhiteSpace(mediaKey) || mediaKey.Length < 15)
         {
             Logger.Error("Nelze přesunout položku do koše: chybí platný identifikátor MediaKey.");
-            return false;
+            return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
         }
 
         await _operationLock.WaitAsync(ct);
@@ -1502,7 +1514,7 @@ public class GooglePhotosEngine : IDisposable
             if (!navOk)
             {
                 Logger.Error($"Mazání zastaveno: navigace na detail položky '{mediaKey}' selhala nebo vypršel časový limit.");
-                return false;
+                return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
             }
 
             await Task.Delay(1500, ct);
@@ -1513,20 +1525,26 @@ public class GooglePhotosEngine : IDisposable
                 _isKnownLoggedIn = false;
                 _manuallyConfirmedSessionEmail = null;
                 Logger.Error($"Mazání zastaveno: uživatel není přihlášen ke Google Photos (URL: {currentUrl}).");
-                return false;
+                return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
             }
 
             if (!IsExactPhotoDetailUrl(currentUrl, mediaKey))
             {
                 Logger.Error($"Mazání zastaveno: otevřená URL '{currentUrl}' neodpovídá položce '{mediaKey}'.");
-                return false;
+                return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
             }
 
             // P1-6: Přesná kontrola, zda položka již nebyla smazána dříve (bez falešné shody '404' v textu)
             if (await CheckIfPhotoAlreadyDeletedInDomAsync(mediaKey))
             {
                 Logger.Info($"Položka '{mediaKey}' již v Google Photos neexistuje (ověřená chybová stránka).");
-                return true;
+                return TrashOutcome.Trashed;
+            }
+
+            if (await IsPhotoInTrashAsync(mediaKey))
+            {
+                Logger.Info($"Položka '{mediaKey}' už leží v koši Google Photos – znovu se nemaže.");
+                return TrashOutcome.Trashed;
             }
 
             // P0-4: Ověřit, že je na stránce vykreslen detail správné fotky a kliknout na tlačítko koše v horní liště
@@ -1590,9 +1608,10 @@ public class GooglePhotosEngine : IDisposable
             if (trashClickStatus != "CLICKED")
             {
                 Logger.Error($"Mazání položky '{mediaKey}' zastaveno – nepodařilo se bezpečně kliknout na ikonu koše ({trashClickStatus}).");
-                return false;
+                return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
             }
 
+            trashClicked = true;
             await Task.Delay(800, ct);
 
             // 2. P0-4 & P1-5: Najít a potvrdit výhradně modální potvrzovací dialog přesunu do koše (žádný Enter naslepo!)
@@ -1637,8 +1656,9 @@ public class GooglePhotosEngine : IDisposable
                 }
                 if (confirmStatus.StartsWith("ERR_", StringComparison.Ordinal))
                 {
-                    Logger.Error($"Mazání položky '{mediaKey}' zastaveno při čekání na potvrzovací dialog ({confirmStatus}).");
-                    return false;
+                    // Např. Google Photos přesunulo fotku do koše rovnou bez dialogu a přešlo na další -> ověřit výsledek
+                    Logger.Warn($"Potvrzovací dialog pro '{mediaKey}' se nezobrazil ({confirmStatus}) – ověřuji výsledek.");
+                    break;
                 }
 
                 await Task.Delay(450, ct);
@@ -1646,8 +1666,7 @@ public class GooglePhotosEngine : IDisposable
 
             if (!dialogConfirmed)
             {
-                Logger.Error($"Mazání položky '{mediaKey}' nebylo potvrzeno – potvrzovací dialog Google Photos se nezobrazil.");
-                return false;
+                Logger.Warn($"Potvrzovací dialog pro '{mediaKey}' nebyl nalezen – ověřuji, zda Google Photos fotku přesto přesunulo do koše.");
             }
 
             // 3. Bod 9: Ověřit skutečný výsledek přesunu do koše.
@@ -1663,7 +1682,7 @@ public class GooglePhotosEngine : IDisposable
                     _isKnownLoggedIn = false;
                     _manuallyConfirmedSessionEmail = null;
                     Logger.Error($"Mazání položky '{mediaKey}' selhalo: prohlížeč byl přesměrován na přihlašovací stránku ({postUrl}).");
-                    return false;
+                    return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
                 }
 
                 var verifyScript = $@"
@@ -1698,13 +1717,13 @@ public class GooglePhotosEngine : IDisposable
                         if (hasErrorToast)
                         {
                             Logger.Error($"Google Photos ohlásilo chybu při přesouvání položky '{mediaKey}' do koše.");
-                            return false;
+                            return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
                         }
 
                         if (hasTrashToast)
                         {
                             Logger.Info($"Položka '{mediaKey}' byla ověřeně přesunuta do koše v Google Photos (potvrzeno hláškou 'Přesunuto do koše').");
-                            return true;
+                            return TrashOutcome.Trashed;
                         }
 
                         if (urlChangedAway)
@@ -1721,15 +1740,21 @@ public class GooglePhotosEngine : IDisposable
             {
                 await Task.Delay(1000, ct);
                 var verifyUrl = _webView.CoreWebView2.Source ?? "";
+                if (!IsLoginOrMarketingUrl(verifyUrl) && await IsPhotoInTrashAsync(mediaKey))
+                {
+                    Logger.Info($"Položka '{mediaKey}' byla ověřeně přesunuta do koše (detail fotky nabízí obnovení z koše).");
+                    return TrashOutcome.Trashed;
+                }
+
                 if (!IsLoginOrMarketingUrl(verifyUrl) && await CheckIfPhotoAlreadyDeletedInDomAsync(mediaKey))
                 {
                     Logger.Info($"Položka '{mediaKey}' byla ověřeně přesunuta do koše (při opětovném načtení již neexistuje).");
-                    return true;
+                    return TrashOutcome.Trashed;
                 }
             }
 
-            Logger.Error($"Nepodařilo se potvrdit, že položka '{mediaKey}' byla skutečně přesunuta do koše. Zůstává ve frontě k opakování.");
-            return false;
+            Logger.Error($"Nepodařilo se potvrdit, že položka '{mediaKey}' byla skutečně přesunuta do koše. Mazání se z bezpečnostních důvodů NEOPAKUJE – zkontrolujte koš v Google Photos.");
+            return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
         }
         catch (OperationCanceledException)
         {
@@ -1738,11 +1763,41 @@ public class GooglePhotosEngine : IDisposable
         catch (Exception ex)
         {
             Logger.Error($"Chyba při přesouvání položky '{mediaKey}' do koše Google Photos: {ex.Message}");
-            return false;
+            return trashClicked ? TrashOutcome.Unconfirmed : TrashOutcome.NotAttempted;
         }
         finally
         {
             _operationLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Detail fotky, která leží v koši, nabízí tlačítko „Obnovit“ / „Restore“ (případně je otevřen přes /trash/).
+    /// </summary>
+    private async Task<bool> IsPhotoInTrashAsync(string mediaKey)
+    {
+        var script = @"
+            (() => {
+                const path = window.location.pathname || '';
+                if (path.includes('/trash')) return true;
+                const els = Array.from(document.querySelectorAll('button, [role=""button""]'))
+                    .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
+                return els.some(b => {
+                    const t = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')).trim();
+                    return /(^|\s)(Obnovit|Restore)(\s|$)/i.test(t);
+                });
+            })();
+        ";
+        try
+        {
+            var currentUrl = _webView.CoreWebView2.Source ?? "";
+            if (!currentUrl.Contains(mediaKey, StringComparison.Ordinal))
+                return false;
+            return await _webView.CoreWebView2.ExecuteScriptAsync(script) == "true";
+        }
+        catch
+        {
+            return false;
         }
     }
 

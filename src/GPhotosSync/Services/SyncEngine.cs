@@ -550,6 +550,7 @@ public class SyncEngine : IDisposable
 
         int trashedCount = 0;
         int failedCount = 0;
+        int unconfirmedCount = 0;
 
         foreach (var item in pendingDeletes)
         {
@@ -596,16 +597,31 @@ public class SyncEngine : IDisposable
                 continue;
             }
 
-            bool ok = await _photosEngine.MoveToTrashAsync(item.MediaKey, item.PhotoUrl, ct);
-            if (ok)
+            var outcome = await _photosEngine.MoveToTrashAsync(item.MediaKey, item.PhotoUrl, ct);
+            if (outcome == TrashOutcome.Trashed)
             {
                 _db.UpdateStatus(item.MediaKey, SyncItemStatus.DeletedLocalAndRemote);
                 trashedCount++;
+            }
+            else if (outcome == TrashOutcome.Unconfirmed)
+            {
+                // Kliknuto, ale bez ověření: neopakovat (mohlo by znovu smazat fotku, kterou uživatel obnovil z koše)
+                _db.UpdateStatus(item.MediaKey, SyncItemStatus.SkippedInitial, SkipReason.DeleteUnconfirmed);
+                unconfirmedCount++;
+                failedCount++;
             }
             else
             {
                 failedCount++;
             }
+        }
+
+        if (unconfirmedCount > 0)
+        {
+            ShowNotification?.Invoke(
+                "Nelze ověřit přesun do koše",
+                $"U {unconfirmedCount} fotek se nepodařilo ověřit přesun do koše v Google Photos. Mazání se neopakuje – zkontrolujte koš ručně.",
+                ToolTipIcon.Warning);
         }
 
         if (trashedCount > 0)
@@ -893,6 +909,18 @@ public class SyncEngine : IDisposable
     public static bool BelongsToBaseline(DateTime? estimatedDate, DateTime installedAt)
     {
         return !estimatedDate.HasValue || estimatedDate.Value.Date < installedAt.Date;
+    }
+
+    /// <summary>
+    /// Položka, kterou aplikace přesunula do koše (nebo se o to pokusila), se znovu objevila v knihovně
+    /// Google Photos -> uživatel ji obnovil z koše a chce ji zpět. Krátce po smazání se nevyhodnocuje
+    /// (stránka může ještě chvíli zobrazovat starý stav).
+    /// </summary>
+    public static bool IsReappearedAfterRemoteDelete(SyncItemRecord record, DateTime now)
+    {
+        bool wasRemoteDeleted = record.Status == SyncItemStatus.DeletedLocalAndRemote ||
+                                (record.Status == SyncItemStatus.SkippedInitial && record.SkipReason == SkipReason.DeleteUnconfirmed);
+        return wasRemoteDeleted && (now - record.UpdatedAt) > TimeSpan.FromMinutes(5);
     }
 
     private const int MaxHashBackfillPerCycle = 100;
@@ -1221,8 +1249,15 @@ public class SyncEngine : IDisposable
             var newItems = new List<DiscoveredMediaItem>();
             foreach (var item in discovered)
             {
-                if (_db.Exists(item.MediaKey))
-                    continue;
+                var existing = _db.GetByMediaKey(item.MediaKey);
+                if (existing != null)
+                {
+                    if (!IsReappearedAfterRemoteDelete(existing, DateTime.Now))
+                        continue;
+
+                    // Fotka smazaná z PC (a přesunutá do koše) je zpět v knihovně -> uživatel ji obnovil z koše
+                    Logger.Info($"Položka '{item.MediaKey}' je znovu v Google Photos (obnovena z koše) – stáhnu ji znovu do složky.");
+                }
 
                 if (!_config.DownloadVideos && item.IsVideo)
                 {
