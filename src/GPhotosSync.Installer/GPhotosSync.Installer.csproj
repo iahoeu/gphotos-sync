@@ -13,7 +13,7 @@
     <RootNamespace>GPhotosSync.Installer</RootNamespace>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>
-    <Version>1.0.7</Version>
+    <Version>1.0.8</Version>
     <Product>Instalátor Google Photos Sync</Product>
     <Description>Instalační program aplikace Google Photos Sync pro Windows</Description>
   </PropertyGroup>
