@@ -299,7 +299,7 @@ public class SettingsForm : Form
         {
             Text = "Průvodce nastavením...",
             Location = new Point(18, 662),
-            Size = new Size(175, 36)
+            Size = new Size(155, 36)
         };
         btnWizard.Click += (_, _) =>
         {
@@ -317,14 +317,22 @@ public class SettingsForm : Form
         var btnSyncNow = new Button
         {
             Text = "Synchronizovat nyní",
-            Location = new Point(202, 662),
-            Size = new Size(165, 36),
+            Location = new Point(180, 662),
+            Size = new Size(150, 36),
             BackColor = Color.FromArgb(26, 115, 232),
             ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat
         };
         btnSyncNow.FlatAppearance.BorderSize = 0;
         btnSyncNow.Click += async (_, _) => await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
+
+        var btnShowBrowser = new Button
+        {
+            Text = "🌐 Zobrazit prohlížeč",
+            Location = new Point(337, 662),
+            Size = new Size(142, 36)
+        };
+        btnShowBrowser.Click += (_, _) => _syncEngine.PhotosEngine.ShowDiagnosticBrowserWindow();
 
         var btnSave = new Button
         {
@@ -344,6 +352,7 @@ public class SettingsForm : Form
         Controls.Add(grpLogs);
         Controls.Add(btnWizard);
         Controls.Add(btnSyncNow);
+        Controls.Add(btnShowBrowser);
         Controls.Add(btnSave);
 
         Logger.OnLogAdded += OnNewLogLine;

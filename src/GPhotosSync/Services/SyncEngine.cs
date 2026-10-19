@@ -339,6 +339,7 @@ public class SyncEngine : IDisposable
 
                 if (cutoffDate.HasValue && item.EstimatedDate.HasValue && item.EstimatedDate.Value.Date < cutoffDate.Value.Date)
                 {
+                    Logger.Info($"Přeskakuji starší položku '{item.MediaKey}' (datum na časové ose {item.EstimatedDate.Value:dd.MM.yyyy} je starší než limit {cutoffDate.Value:dd.MM.yyyy}).");
                     _db.UpsertItem(new SyncItemRecord
                     {
                         MediaKey = item.MediaKey,
@@ -356,6 +357,7 @@ public class SyncEngine : IDisposable
 
             if (newItems.Count == 0)
             {
+                Logger.Info("Žádné nové položky ke stažení v tomto cyklu.");
                 RaiseStatus($"Synchronizováno ({DateTime.Now:HH:mm})", isSyncing: false);
                 return;
             }
@@ -391,9 +393,17 @@ public class SyncEngine : IDisposable
 
                 if (res.Success)
                 {
-                    // Check if actual EXIF date is older than cutoffDate (when aria-label didn't have a parsed date)
-                    if (cutoffDate.HasValue && res.TakenAt.HasValue && res.TakenAt.Value.Date < cutoffDate.Value.Date)
+                    // Check if actual EXIF date is older than cutoffDate ONLY when timeline didn't already confirm it's recent
+                    bool timelineConfirmedRecent = item.EstimatedDate.HasValue &&
+                                                   cutoffDate.HasValue &&
+                                                   item.EstimatedDate.Value.Date >= cutoffDate.Value.Date;
+
+                    if (!timelineConfirmedRecent &&
+                        cutoffDate.HasValue &&
+                        res.TakenAt.HasValue &&
+                        res.TakenAt.Value.Date < cutoffDate.Value.Date)
                     {
+                        Logger.Info($"Přeskakuji stažený soubor '{res.LocalFileName}' – EXIF datum pořízení ({res.TakenAt.Value:dd.MM.yyyy}) je starší než zvolený limit ({cutoffDate.Value:dd.MM.yyyy}).");
                         try { File.Delete(res.FullPath); } catch { }
                         _db.UpsertItem(new SyncItemRecord
                         {

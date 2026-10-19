@@ -288,11 +288,19 @@ public class SetupWizardForm : Form
 
     private async Task RefreshLoginStatusAsync()
     {
+        if (_photosEngine.IsKnownLoggedIn)
+        {
+            _lblAccountStatus.Text = "✓ Účet Google Photos je připojen a připraven.";
+            _lblAccountStatus.ForeColor = Color.FromArgb(20, 135, 55);
+            _btnLogin.Text = "Změnit účet Google...";
+            return;
+        }
+
         _lblAccountStatus.Text = "Ověřuji přihlášení ke Google Photos...";
         _lblAccountStatus.ForeColor = Color.DimGray;
 
         bool loggedIn = await _photosEngine.CheckLoggedInAsync();
-        if (loggedIn)
+        if (loggedIn || _photosEngine.IsKnownLoggedIn)
         {
             _lblAccountStatus.Text = "✓ Účet Google Photos je připojen a připraven.";
             _lblAccountStatus.ForeColor = Color.FromArgb(20, 135, 55);
@@ -310,6 +318,10 @@ public class SetupWizardForm : Form
     {
         using var loginForm = new GoogleLoginForm(_photosEngine);
         loginForm.ShowDialog(this);
+        if (loginForm.LoginSucceeded)
+        {
+            _photosEngine.IsKnownLoggedIn = true;
+        }
         await RefreshLoginStatusAsync();
     }
 

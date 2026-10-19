@@ -27,41 +27,142 @@ public class DownloadResult
     public string? ErrorMessage { get; set; }
 }
 
+/// <summary>
+/// Speciální neaktivní okno umístěné mimo obrazovku, které ale zůstává pro systém Windows
+/// a Chromium (WebView2) "viditelné" (Visible = true, Opacity = 1.0), aby Google Photos
+/// nezastavovalo vykreslování virtuální mřížky fotek (IntersectionObserver / requestAnimationFrame).
+/// </summary>
+internal sealed class OffScreenBrowserForm : Form
+{
+    private bool _isUserVisible;
+
+    public OffScreenBrowserForm()
+    {
+        Text = "Google Photos Sync – Prohlížeč na pozadí";
+        Width = 1280;
+        Height = 900;
+        ShowInTaskbar = false;
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        Location = new Point(-32000, -32000);
+        Opacity = 1.0; // MUST be 1.0 so Chromium does not treat the window as transparent/occluded
+    }
+
+    protected override bool ShowWithoutActivation => !_isUserVisible;
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            if (!_isUserVisible)
+            {
+                const int WS_EX_TOOLWINDOW = 0x00000080;
+                const int WS_EX_NOACTIVATE = 0x08000000;
+                cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            }
+            return cp;
+        }
+    }
+
+    public void MoveOffScreen()
+    {
+        _isUserVisible = false;
+        ShowInTaskbar = false;
+        FormBorderStyle = FormBorderStyle.None;
+        Location = new Point(-32000, -32000);
+        Width = 1280;
+        Height = 900;
+        if (!Visible)
+        {
+            Show();
+        }
+    }
+
+    public void ShowOnScreenForDiagnostics()
+    {
+        _isUserVisible = true;
+        FormBorderStyle = FormBorderStyle.Sizable;
+        ShowInTaskbar = true;
+        Width = 1150;
+        Height = 800;
+        Location = new Point(
+            Math.Max(40, (Screen.PrimaryScreen?.WorkingArea.Width ?? 1400) / 2 - 575),
+            Math.Max(40, (Screen.PrimaryScreen?.WorkingArea.Height ?? 900) / 2 - 400));
+        if (!Visible)
+        {
+            Show();
+        }
+        BringToFront();
+        Activate();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (e.CloseReason == CloseReason.UserClosing && _isUserVisible)
+        {
+            // Don't destroy the background browser when user closes the diagnostic window; move it back off-screen
+            e.Cancel = true;
+            MoveOffScreen();
+            return;
+        }
+        base.OnFormClosing(e);
+    }
+}
+
 public class GooglePhotosEngine : IDisposable
 {
-    private readonly Form _hostForm;
+    private readonly OffScreenBrowserForm _hostForm;
     private readonly WebView2 _webView;
     private CoreWebView2Environment? _env;
     private readonly SemaphoreSlim _operationLock = new(1, 1);
     private bool _isInitialized;
+    private bool _isKnownLoggedIn;
 
     private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".3gp", ".webm", ".mts", ".m2ts"
     };
 
+    private static readonly Dictionary<string, int> CzechMonths = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["leden"] = 1, ["ledna"] = 1, ["led"] = 1,
+        ["únor"] = 2, ["února"] = 2, ["unor"] = 2, ["unora"] = 2, ["úno"] = 2,
+        ["březen"] = 3, ["března"] = 3, ["brezen"] = 3, ["brezna"] = 3, ["bře"] = 3,
+        ["duben"] = 4, ["dubna"] = 4, ["dub"] = 4,
+        ["květen"] = 5, ["května"] = 5, ["kveten"] = 5, ["kvetna"] = 5, ["kvě"] = 5,
+        ["červen"] = 6, ["června"] = 6, ["cerven"] = 6, ["cervna"] = 6, ["čvn"] = 6,
+        ["červenec"] = 7, ["července"] = 7, ["cervenec"] = 7, ["cervence"] = 7, ["čvc"] = 7,
+        ["srpen"] = 8, ["srpna"] = 8, ["srp"] = 8,
+        ["září"] = 9, ["zari"] = 9, ["zář"] = 9,
+        ["říjen"] = 10, ["října"] = 10, ["rijen"] = 10, ["rijna"] = 10, ["říj"] = 10,
+        ["listopad"] = 11, ["listopadu"] = 11, ["lis"] = 11,
+        ["prosinec"] = 12, ["prosince"] = 12, ["pro"] = 12
+    };
+
+    public bool IsKnownLoggedIn
+    {
+        get => _isKnownLoggedIn;
+        set => _isKnownLoggedIn = value;
+    }
+
     public GooglePhotosEngine()
     {
-        // Hidden form hosting the background WebView2 instance
-        _hostForm = new Form
-        {
-            Width = 1280,
-            Height = 900,
-            ShowInTaskbar = false,
-            FormBorderStyle = FormBorderStyle.None,
-            StartPosition = FormStartPosition.Manual,
-            Location = new Point(-30000, -30000),
-            Opacity = 0
-        };
-
+        _hostForm = new OffScreenBrowserForm();
         _webView = new WebView2
         {
             Dock = DockStyle.Fill
         };
         _hostForm.Controls.Add(_webView);
 
-        // Force handle creation so WebView2 initializes even while hidden
+        // Force handle creation and keep form visible off-screen so WebView2 never suspends rendering
         var _ = _hostForm.Handle;
+        _hostForm.MoveOffScreen();
+    }
+
+    public void ShowDiagnosticBrowserWindow()
+    {
+        _hostForm.ShowOnScreenForDiagnostics();
     }
 
     public async Task EnsureInitializedAsync()
@@ -70,20 +171,38 @@ public class GooglePhotosEngine : IDisposable
             return;
 
         Directory.CreateDirectory(AppConfig.WebViewProfileFolder);
+
+        // Critical Chromium flags so WebView2 renders virtualized grids (Google Photos) even when off-screen or in a VM
+        var options = new CoreWebView2EnvironmentOptions(
+            "--disable-background-timer-throttling " +
+            "--disable-backgrounding-occluded-windows " +
+            "--disable-renderer-backgrounding " +
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling");
+
         _env = await CoreWebView2Environment.CreateAsync(
             browserExecutableFolder: null,
-            userDataFolder: AppConfig.WebViewProfileFolder);
+            userDataFolder: AppConfig.WebViewProfileFolder,
+            options: options);
 
         if (!_hostForm.Visible)
         {
-            _hostForm.Show();
-            _hostForm.Hide();
+            _hostForm.MoveOffScreen();
         }
 
         await _webView.EnsureCoreWebView2Async(_env);
         _webView.CoreWebView2!.Settings.IsStatusBarEnabled = false;
         _webView.CoreWebView2.Settings.AreDefaultScriptDialogsEnabled = false;
         _webView.CoreWebView2.IsMuted = true;
+
+        // Force document.visibilityState to always report 'visible' so Google Photos lazy loader stays active
+        await _webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(@"
+            try {
+                Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+                Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+                Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+                Object.defineProperty(document, 'webkitHidden', { get: () => false, configurable: true });
+            } catch (e) {}
+        ");
 
         _isInitialized = true;
     }
@@ -100,39 +219,49 @@ public class GooglePhotosEngine : IDisposable
         try
         {
             await EnsureInitializedAsync();
-            bool navOk = await NavigateAndWaitAsync("https://photos.google.com/", 15000);
-            if (!navOk) return false;
+            await NavigateAndWaitForDomAsync("https://photos.google.com/", 12000);
 
-            await Task.Delay(1500);
-            var url = _webView.CoreWebView2.Source ?? "";
-            if (url.Contains("accounts.google.com", StringComparison.OrdinalIgnoreCase) ||
-                url.Contains("/about", StringComparison.OrdinalIgnoreCase) ||
-                url.Contains("workspace.google.com", StringComparison.OrdinalIgnoreCase))
+            for (int attempt = 0; attempt < 6; attempt++)
             {
-                return false;
+                await Task.Delay(700);
+                var url = _webView.CoreWebView2.Source ?? "";
+                if (url.Contains("accounts.google.com", StringComparison.OrdinalIgnoreCase) ||
+                    url.Contains("/about", StringComparison.OrdinalIgnoreCase) ||
+                    url.Contains("workspace.google.com", StringComparison.OrdinalIgnoreCase))
+                {
+                    _isKnownLoggedIn = false;
+                    return false;
+                }
+
+                var checkJs = @"
+                    (() => {
+                        const hasPhotos = document.querySelectorAll('a[href*=""/photo/""], a[href*=""photo/""]').length > 0;
+                        const hasAppShell = document.querySelector('c-wiz') !== null &&
+                                            (document.querySelector('input[aria-label]') !== null ||
+                                             document.querySelector('a[aria-label*=""Google""]') !== null ||
+                                             document.querySelector('img[src*=""googleusercontent""]') !== null ||
+                                             document.querySelector('[role=""main""]') !== null);
+                        const hasSignInBtn = Array.from(document.querySelectorAll('a, button'))
+                            .some(el => /^(Přihlásit se|Sign in|Přejít do Fotek Google|Go to Google Photos)$/i.test((el.innerText || '').trim()));
+                        if (hasSignInBtn && !hasPhotos) return false;
+                        return hasPhotos || hasAppShell;
+                    })();
+                ";
+
+                var result = await _webView.CoreWebView2.ExecuteScriptAsync(checkJs);
+                if (result == "true")
+                {
+                    _isKnownLoggedIn = true;
+                    return true;
+                }
             }
 
-            var checkJs = @"
-                (() => {
-                    const hasPhotos = document.querySelectorAll('a[href*=""/photo/""]').length > 0;
-                    const hasAppShell = document.querySelector('c-wiz') !== null &&
-                                        (document.querySelector('input[aria-label]') !== null ||
-                                         document.querySelector('a[aria-label*=""Google""]') !== null ||
-                                         document.querySelector('img[src*=""googleusercontent""]') !== null);
-                    const hasSignInBtn = Array.from(document.querySelectorAll('a, button'))
-                        .some(el => /Přihlásit|Sign in|Přejít do Fotek Google|Go to Google Photos/i.test(el.innerText || ''));
-                    if (hasSignInBtn && !hasPhotos) return false;
-                    return hasPhotos || hasAppShell;
-                })();
-            ";
-
-            var result = await _webView.CoreWebView2.ExecuteScriptAsync(checkJs);
-            return result == "true";
+            return _isKnownLoggedIn;
         }
         catch (Exception ex)
         {
             Logger.Warn($"Kontrola přihlášení selhala: {ex.Message}");
-            return false;
+            return _isKnownLoggedIn;
         }
         finally
         {
@@ -148,74 +277,201 @@ public class GooglePhotosEngine : IDisposable
             await EnsureInitializedAsync();
             var itemsById = new Dictionary<string, DiscoveredMediaItem>(StringComparer.Ordinal);
 
-            bool navOk = await NavigateAndWaitAsync("https://photos.google.com/", 20000);
-            if (!navOk) return [];
+            Logger.Info("Otevírám časovou osu Google Photos (https://photos.google.com/)...");
+            await NavigateAndWaitForDomAsync("https://photos.google.com/", 18000);
 
-            // Wait for timeline items to render
-            for (int wait = 0; wait < 12; wait++)
+            // Trigger resize & scroll wakeup so Google Photos virtualized grid mounts items immediately
+            await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                (() => {
+                    window.dispatchEvent(new Event('resize'));
+                    window.dispatchEvent(new Event('focus'));
+                    document.dispatchEvent(new Event('visibilitychange'));
+                })();
+            ");
+
+            // Wait up to 10 seconds for timeline photo elements to mount in the DOM
+            int domAnchorCount = 0;
+            for (int wait = 0; wait < 15; wait++)
             {
-                await Task.Delay(500, ct);
-                var countJson = await _webView.CoreWebView2.ExecuteScriptAsync(
-                    "document.querySelectorAll('a[href*=\"/photo/\"]').length");
-                if (int.TryParse(countJson, out int c) && c > 0)
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(600, ct);
+
+                var countJson = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                    (() => {
+                        return document.querySelectorAll('a[href*=""/photo/""], a[href*=""photo/""]').length;
+                    })();
+                ");
+
+                if (int.TryParse(countJson, out domAnchorCount) && domAnchorCount > 0)
+                {
                     break;
+                }
+
+                // Nudge scroll slightly to wake up IntersectionObserver if needed
+                if (wait == 4 || wait == 8)
+                {
+                    await _webView.CoreWebView2.ExecuteScriptAsync("window.scrollBy(0, 120); window.scrollBy(0, -120);");
+                }
             }
+
+            var currentUrl = _webView.CoreWebView2.Source ?? "";
+            Logger.Info($"Stránka Google Photos načtena ({currentUrl}), počáteční počet DOM odkazů: {domAnchorCount}.");
 
             for (int step = 0; step < maxScrollSteps; step++)
             {
                 ct.ThrowIfCancellationRequested();
 
+                // Extract from both rendered DOM anchors (including Shadow DOM / c-wiz) AND AF_initDataCallback scripts
                 var extractScript = @"
                     (() => {
-                        const anchors = Array.from(document.querySelectorAll('a[href*=""/photo/""]'));
-                        return anchors.map(a => {
-                            const href = a.getAttribute('href') || '';
-                            const label = a.getAttribute('aria-label') || '';
-                            const isVid = /video|videa/i.test(label) || a.querySelector('[aria-label*=""Video""], [aria-label*=""video""]') !== null;
-                            return { href, label, isVid };
-                        });
+                        const results = [];
+                        const seen = new Set();
+
+                        function addEntry(hrefOrKey, label, isVid, dateHint) {
+                            let key = '';
+                            const idx = hrefOrKey.indexOf('/photo/');
+                            if (idx >= 0) {
+                                key = hrefOrKey.substring(idx + 7).split(/[?#/]/)[0].trim();
+                            } else if (/^AF1Qip[A-Za-z0-9_-]{20,}$/.test(hrefOrKey)) {
+                                key = hrefOrKey;
+                            }
+                            if (!key || key.length < 15 || seen.has(key)) return;
+                            seen.add(key);
+                            results.push({
+                                key: key,
+                                label: label || '',
+                                isVid: !!isVid,
+                                dateHint: dateHint || ''
+                            });
+                        }
+
+                        // 1. Collect all <a> elements containing /photo/ (including shadow roots)
+                        function queryAllDeep(root) {
+                            const anchors = root.querySelectorAll ? Array.from(root.querySelectorAll('a[href*=""photo/""]')) : [];
+                            for (const a of anchors) {
+                                const href = a.getAttribute('href') || a.href || '';
+                                // Ignore album or trash sub-links if they aren't direct timeline photos, except /photo/
+                                if (href.includes('/album/') && !href.includes('/photo/')) continue;
+
+                                let label = a.getAttribute('aria-label') || '';
+                                if (!label) {
+                                    const img = a.querySelector('img[alt], [aria-label]');
+                                    if (img) label = img.getAttribute('aria-label') || img.getAttribute('alt') || '';
+                                }
+
+                                // Find nearest section date header (e.g. 'Dnes', 'Včera', 'so 17. 10.')
+                                let dateHint = '';
+                                let parent = a.parentElement;
+                                for (let depth = 0; depth < 7 && parent; depth++) {
+                                    const prev = parent.previousElementSibling;
+                                    if (prev) {
+                                        const hTxt = (prev.innerText || '').trim().split('\n')[0];
+                                        if (hTxt && hTxt.length < 40) {
+                                            dateHint = hTxt;
+                                            break;
+                                        }
+                                    }
+                                    parent = parent.parentElement;
+                                }
+
+                                const isVid = /video|videa|přehrát|play/i.test(label) ||
+                                              a.querySelector('[aria-label*=""Video""], [aria-label*=""video""], [data-is-video=""true""]') !== null;
+
+                                addEntry(href, label, isVid, dateHint);
+                            }
+
+                            const allEls = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                            for (const el of allEls) {
+                                if (el.shadowRoot) {
+                                    queryAllDeep(el.shadowRoot);
+                                }
+                            }
+                        }
+
+                        queryAllDeep(document);
+
+                        // 2. Fallback: parse AF_initDataCallback script blocks if DOM virtualization hid any items
+                        if (results.length === 0) {
+                            const scripts = Array.from(document.querySelectorAll('script'));
+                            const keyRegex = /""(AF1Qip[A-Za-z0-9_-]{22,80})""/g;
+                            for (const s of scripts) {
+                                const txt = s.textContent || '';
+                                if (!txt.includes('AF1Qip')) continue;
+                                let m;
+                                while ((m = keyRegex.exec(txt)) !== null) {
+                                    addEntry(m[1], '', false, '');
+                                }
+                            }
+                        }
+
+                        return JSON.stringify(results);
                     })();
                 ";
 
-                var json = await _webView.CoreWebView2.ExecuteScriptAsync(extractScript);
-                if (!string.IsNullOrWhiteSpace(json) && json != "null")
+                var rawJson = await _webView.CoreWebView2.ExecuteScriptAsync(extractScript);
+                if (!string.IsNullOrWhiteSpace(rawJson) && rawJson != "null")
                 {
-                    using var doc = JsonDocument.Parse(json);
-                    if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                    // ExecuteScriptAsync returns a JSON-encoded string when the script returns JSON.stringify(...)
+                    var innerJson = JsonSerializer.Deserialize<string>(rawJson);
+                    if (!string.IsNullOrWhiteSpace(innerJson))
                     {
-                        foreach (var elem in doc.RootElement.EnumerateArray())
+                        using var doc = JsonDocument.Parse(innerJson);
+                        if (doc.RootElement.ValueKind == JsonValueKind.Array)
                         {
-                            var href = elem.GetProperty("href").GetString() ?? "";
-                            var label = elem.GetProperty("label").GetString() ?? "";
-                            var isVid = elem.GetProperty("isVid").GetBoolean();
-
-                            var key = ExtractMediaKey(href);
-                            if (string.IsNullOrEmpty(key) || itemsById.ContainsKey(key))
-                                continue;
-
-                            itemsById[key] = new DiscoveredMediaItem
+                            foreach (var elem in doc.RootElement.EnumerateArray())
                             {
-                                MediaKey = key,
-                                PhotoUrl = $"https://photos.google.com/photo/{key}",
-                                AriaLabel = label,
-                                IsVideo = isVid,
-                                EstimatedDate = ParseDateFromAriaLabel(label)
-                            };
+                                var key = elem.GetProperty("key").GetString() ?? "";
+                                var label = elem.GetProperty("label").GetString() ?? "";
+                                var dateHint = elem.TryGetProperty("dateHint", out var dh) ? dh.GetString() ?? "" : "";
+                                var isVid = elem.GetProperty("isVid").GetBoolean();
+
+                                if (string.IsNullOrEmpty(key) || itemsById.ContainsKey(key))
+                                    continue;
+
+                                var estimatedDate = ParseDateFromAriaLabel(label) ?? ParseDateFromAriaLabel(dateHint);
+
+                                itemsById[key] = new DiscoveredMediaItem
+                                {
+                                    MediaKey = key,
+                                    PhotoUrl = $"https://photos.google.com/photo/{key}",
+                                    AriaLabel = !string.IsNullOrWhiteSpace(label) ? label : dateHint,
+                                    IsVideo = isVid,
+                                    EstimatedDate = estimatedDate
+                                };
+                            }
                         }
                     }
                 }
 
+                Logger.Info($"Skenování časové osy (krok {step + 1}/{maxScrollSteps}): doposud nalezeno {itemsById.Count} položek.");
+
                 if (step < maxScrollSteps - 1)
                 {
+                    // Scroll both window and any scrollable containers + send mouse wheel event
                     await _webView.CoreWebView2.ExecuteScriptAsync(@"
                         (() => {
-                            window.scrollBy(0, 1400);
-                            const scrollers = Array.from(document.querySelectorAll('c-wiz, main, [role=""main""]'))
-                                .filter(el => el.scrollHeight > el.clientHeight);
-                            scrollers.forEach(el => el.scrollTop += 1400);
+                            window.scrollBy(0, 1200);
+                            if (document.scrollingElement) document.scrollingElement.scrollTop += 1200;
+                            const all = Array.from(document.querySelectorAll('c-wiz, main, [role=""main""], div'));
+                            for (const el of all) {
+                                if (el.scrollHeight > el.clientHeight + 80 && el.clientHeight > 200) {
+                                    const style = window.getComputedStyle(el);
+                                    if (style.overflowY === 'auto' || style.overflowY === 'scroll' || el.tagName === 'C-WIZ') {
+                                        el.scrollTop += 1200;
+                                    }
+                                }
+                            }
                         })();
                     ");
-                    await Task.Delay(900, ct);
+
+                    try
+                    {
+                        await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchMouseEvent",
+                            @"{""type"":""mouseWheel"",""x"":640,""y"":450,""deltaX"":0,""deltaY"":1200}");
+                    }
+                    catch { }
+
+                    await Task.Delay(1000, ct);
                 }
             }
 
@@ -260,7 +516,7 @@ public class GooglePhotosEngine : IDisposable
                     originalFileName = Path.GetFileName(e.ResultFilePath);
                     if (string.IsNullOrWhiteSpace(originalFileName))
                     {
-                        originalFileName = $"{item.MediaKey.Substring(0, Math.Min(12, item.MediaKey.Length))}.jpg";
+                        originalFileName = $"{item.MediaKey[..Math.Min(12, item.MediaKey.Length)]}.jpg";
                     }
 
                     var ext = Path.GetExtension(originalFileName);
@@ -314,26 +570,27 @@ public class GooglePhotosEngine : IDisposable
             _webView.CoreWebView2.DownloadStarting += OnDownloadStarting;
             try
             {
-                bool navOk = await NavigateAndWaitAsync(item.PhotoUrl, 20000);
-                if (!navOk)
-                {
-                    return new DownloadResult
-                    {
-                        Success = false,
-                        ErrorMessage = "Nelze otevřít detail fotky v Google Photos."
-                    };
-                }
+                Logger.Info($"Otevírám detail položky pro stažení: {item.PhotoUrl}");
+                await NavigateAndWaitForDomAsync(item.PhotoUrl, 15000);
+                await Task.Delay(1500, ct);
 
-                await Task.Delay(1200, ct);
-
-                // Trigger Shift+D via CDP (native Google Photos shortcut for downloading original file)
+                // Method 1: Trigger Shift+D via CDP + JS KeyboardEvent
                 await DispatchShiftDAsync();
 
-                // Wait up to 4 seconds to see if download started; if not, try clicking UI Download button
-                var startCheck = await Task.WhenAny(tcsDownload.Task, Task.Delay(4000, ct));
-                if (startCheck != tcsDownload.Task && tempFilePath == null)
+                var startCheck1 = await Task.WhenAny(tcsDownload.Task, Task.Delay(3000, ct));
+                if (startCheck1 != tcsDownload.Task && tempFilePath == null)
                 {
+                    // Method 2: Click 'More options' (three dots) -> 'Download / Stáhnout' in Google Photos UI
+                    Logger.Info($"Zkouším stahování přes menu 'Další možnosti -> Stáhnout' pro {item.MediaKey}...");
                     await TriggerDownloadFromUiMenuAsync();
+                }
+
+                var startCheck2 = await Task.WhenAny(tcsDownload.Task, Task.Delay(3500, ct));
+                if (startCheck2 != tcsDownload.Task && tempFilePath == null)
+                {
+                    // Method 3: Direct googleusercontent.com '=d' original download link extraction
+                    Logger.Info($"Zkouším přímý stahovací odkaz (=d) pro {item.MediaKey}...");
+                    await TriggerDirectGoogleUserContentDownloadAsync();
                 }
 
                 // Wait for download completion (up to 10 minutes for large videos)
@@ -414,9 +671,7 @@ public class GooglePhotosEngine : IDisposable
 
             Logger.Info($"Obousměrná synchronizace: Přesouvám položku '{mediaKey}' do koše v Google Photos...");
 
-            bool navOk = await NavigateAndWaitAsync(url, 20000);
-            if (!navOk) return false;
-
+            await NavigateAndWaitForDomAsync(url, 15000);
             await Task.Delay(1500, ct);
 
             // Check if already deleted / 404
@@ -446,10 +701,10 @@ public class GooglePhotosEngine : IDisposable
                         'div[role=""button""][aria-label*=""Delete""]'
                     ];
                     for (const sel of selectors) {
-                        const btns = Array.from(document.querySelectorAll(sel));
-                        const visible = btns.find(b => b.offsetParent !== null);
-                        if (visible) {
-                            visible.click();
+                        const btns = Array.from(document.querySelectorAll(sel))
+                            .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
+                        if (btns.length > 0) {
+                            btns[btns.length - 1].click();
                             return true;
                         }
                     }
@@ -459,7 +714,6 @@ public class GooglePhotosEngine : IDisposable
 
             if (clickedToolbarTrash != "true")
             {
-                // Fallback: Google Photos keyboard shortcut '#' moves open photo to trash
                 await DispatchHashKeyAsync();
             }
 
@@ -484,7 +738,6 @@ public class GooglePhotosEngine : IDisposable
                             }
                         }
 
-                        // Global button search if dialog role is custom
                         const allBtns = Array.from(document.querySelectorAll('button'));
                         const globalConfirm = allBtns.find(b => {
                             const t = (b.innerText || '').trim();
@@ -508,7 +761,6 @@ public class GooglePhotosEngine : IDisposable
                 await Task.Delay(500, ct);
             }
 
-            // Fallback: Press Enter in case the confirmation button already has focus
             await DispatchEnterKeyAsync();
             await Task.Delay(1000, ct);
             return true;
@@ -529,10 +781,24 @@ public class GooglePhotosEngine : IDisposable
         try
         {
             await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent",
-                @"{""type"":""keyDown"",""modifiers"":8,""windowsVirtualKeyCode"":68,""key"":""D"",""code"":""KeyD""}");
-            await Task.Delay(80);
+                @"{""type"":""rawKeyDown"",""modifiers"":8,""windowsVirtualKeyCode"":68,""nativeVirtualKeyCode"":68,""key"":""D"",""code"":""KeyD""}");
             await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent",
-                @"{""type"":""keyUp"",""modifiers"":8,""windowsVirtualKeyCode"":68,""key"":""D"",""code"":""KeyD""}");
+                @"{""type"":""char"",""modifiers"":8,""windowsVirtualKeyCode"":68,""key"":""D"",""text"":""D"",""unmodifiedText"":""d""}");
+            await Task.Delay(60);
+            await _webView.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchKeyEvent",
+                @"{""type"":""keyUp"",""modifiers"":8,""windowsVirtualKeyCode"":68,""nativeVirtualKeyCode"":68,""key"":""D"",""code"":""KeyD""}");
+
+            // Also dispatch synthetic JS keyboard event in case focus is inside a custom element
+            await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                (() => {
+                    const target = document.activeElement || document.body;
+                    for (const type of ['keydown', 'keypress', 'keyup']) {
+                        target.dispatchEvent(new KeyboardEvent(type, {
+                            key: 'D', code: 'KeyD', keyCode: 68, which: 68, shiftKey: true, bubbles: true, cancelable: true
+                        }));
+                    }
+                })();
+            ");
         }
         catch (Exception ex)
         {
@@ -573,21 +839,27 @@ public class GooglePhotosEngine : IDisposable
     {
         try
         {
-            // Open 'More options' (three dots) menu and click 'Download / Stáhnout'
+            // Pick the LAST visible 'More options' button in the DOM (which belongs to the active photo overlay)
             await _webView.CoreWebView2.ExecuteScriptAsync(@"
                 (() => {
-                    const moreBtns = Array.from(document.querySelectorAll('button[aria-label*=""Další možnosti""], button[aria-label*=""More options""], div[role=""button""][aria-label*=""Další možnosti""], div[role=""button""][aria-label*=""More options""]'));
-                    const visibleMore = moreBtns.find(b => b.offsetParent !== null);
-                    if (visibleMore) visibleMore.click();
+                    const moreBtns = Array.from(document.querySelectorAll(
+                        'button[aria-label*=""Další možnosti""], button[aria-label*=""More options""], ' +
+                        'div[role=""button""][aria-label*=""Další možnosti""], div[role=""button""][aria-label*=""More options""]'
+                    )).filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
+
+                    if (moreBtns.length > 0) {
+                        moreBtns[moreBtns.length - 1].click();
+                    }
                 })();
             ");
-            await Task.Delay(500);
+            await Task.Delay(600);
             await _webView.CoreWebView2.ExecuteScriptAsync(@"
                 (() => {
-                    const items = Array.from(document.querySelectorAll('[role=""menuitem""], button, a'));
+                    const items = Array.from(document.querySelectorAll('[role=""menuitem""], [role=""option""], li, button, a'))
+                        .filter(el => el.offsetParent !== null && el.getBoundingClientRect().width > 0);
                     const dl = items.find(el => {
                         const txt = (el.innerText || el.getAttribute('aria-label') || '').trim();
-                        return /Stáhnout|Download/i.test(txt) && el.offsetParent !== null;
+                        return /^(Stáhnout|Download)(\b|\s|Shift)/i.test(txt) || /Stáhnout originál|Download original/i.test(txt);
                     });
                     if (dl) dl.click();
                 })();
@@ -599,7 +871,47 @@ public class GooglePhotosEngine : IDisposable
         }
     }
 
-    private async Task<bool> NavigateAndWaitAsync(string url, int timeoutMs)
+    private async Task TriggerDirectGoogleUserContentDownloadAsync()
+    {
+        try
+        {
+            // Find the main high-res photo/video URL on the photo detail page and append '=d' to force original file download
+            var directUrlJson = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                (() => {
+                    const imgs = Array.from(document.querySelectorAll('img[src*=""googleusercontent.com""]'))
+                        .filter(img => img.src && !img.src.includes('/a/') && !img.src.includes('=s'))
+                        .sort((a, b) => (b.naturalWidth * b.naturalHeight || b.clientWidth * b.clientHeight) - (a.naturalWidth * a.naturalHeight || a.clientWidth * a.clientHeight));
+
+                    if (imgs.length > 0) {
+                        let baseUrl = imgs[0].src.split('=')[0];
+                        return baseUrl + '=d';
+                    }
+                    return '';
+                })();
+            ");
+
+            var directUrl = JsonSerializer.Deserialize<string>(directUrlJson ?? "\"\"");
+            if (!string.IsNullOrWhiteSpace(directUrl) && directUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                await _webView.CoreWebView2.ExecuteScriptAsync($@"
+                    (() => {{
+                        const a = document.createElement('a');
+                        a.href = {JsonSerializer.Serialize(directUrl)};
+                        a.download = '';
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                    }})();
+                ");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Nelze spustit přímé stažení (=d): {ex.Message}");
+        }
+    }
+
+    private async Task NavigateAndWaitForDomAsync(string url, int timeoutMs)
     {
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -612,8 +924,11 @@ public class GooglePhotosEngine : IDisposable
         try
         {
             _webView.CoreWebView2.Navigate(url);
-            var completed = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
-            return completed == tcs.Task && await tcs.Task;
+            await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Navigace na '{url}' hlásí varování: {ex.Message}");
         }
         finally
         {
@@ -621,32 +936,45 @@ public class GooglePhotosEngine : IDisposable
         }
     }
 
-    private static string ExtractMediaKey(string href)
-    {
-        var idx = href.IndexOf("/photo/", StringComparison.OrdinalIgnoreCase);
-        if (idx < 0) return string.Empty;
-        var key = href[(idx + 7)..];
-        var qIdx = key.IndexOfAny(['?', '#', '/']);
-        if (qIdx >= 0) key = key[..qIdx];
-        return key.Trim();
-    }
-
     private static DateTime? ParseDateFromAriaLabel(string label)
     {
         if (string.IsNullOrWhiteSpace(label)) return null;
 
-        // Try Czech date format inside aria-label: e.g. "19. 10. 2026" or "19. října 2026"
-        var czNumMatch = Regex.Match(label, @"(?<d>\d{1,2})\.\s*(?<m>\d{1,2})\.\s*(?<y>20\d{2})");
+        var trimmed = label.Trim();
+        if (Regex.IsMatch(trimmed, @"\b(dnes|today)\b", RegexOptions.IgnoreCase))
+            return DateTime.Today;
+        if (Regex.IsMatch(trimmed, @"\b(včera|vcera|yesterday)\b", RegexOptions.IgnoreCase))
+            return DateTime.Today.AddDays(-1);
+
+        // 1. Try numeric Czech format: "19. 10. 2026" or "19. 10."
+        var czNumMatch = Regex.Match(trimmed, @"(?<d>\d{1,2})\.\s*(?<m>\d{1,2})\.(\s*(?<y>20\d{2}))?");
         if (czNumMatch.Success &&
-            int.TryParse(czNumMatch.Groups["y"].Value, out int y) &&
-            int.TryParse(czNumMatch.Groups["m"].Value, out int m) &&
-            int.TryParse(czNumMatch.Groups["d"].Value, out int d))
+            int.TryParse(czNumMatch.Groups["m"].Value, out int mNum) && mNum is >= 1 and <= 12 &&
+            int.TryParse(czNumMatch.Groups["d"].Value, out int dNum) && dNum is >= 1 and <= 31)
         {
-            try { return new DateTime(y, m, d); } catch { }
+            int yNum = czNumMatch.Groups["y"].Success && int.TryParse(czNumMatch.Groups["y"].Value, out int parsedY)
+                ? parsedY
+                : DateTime.Today.Year;
+            try { return new DateTime(yNum, mNum, dNum); } catch { }
         }
 
-        // Try English / International formats inside aria-label: e.g. "Oct 19, 2026" or "19 Oct 2026"
-        var parts = label.Split(['-', '–', '—', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        // 2. Try Czech word month format: "19. října 2026" or "19. října"
+        var czWordMatch = Regex.Match(trimmed, @"(?<d>\d{1,2})\.\s*(?<month>[a-zA-ZáčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ]+)(\s+(?<y>20\d{2}))?");
+        if (czWordMatch.Success &&
+            int.TryParse(czWordMatch.Groups["d"].Value, out int dWord) && dWord is >= 1 and <= 31)
+        {
+            var mName = czWordMatch.Groups["month"].Value;
+            if (CzechMonths.TryGetValue(mName, out int mWord))
+            {
+                int yWord = czWordMatch.Groups["y"].Success && int.TryParse(czWordMatch.Groups["y"].Value, out int parsedY2)
+                    ? parsedY2
+                    : DateTime.Today.Year;
+                try { return new DateTime(yWord, mWord, dWord); } catch { }
+            }
+        }
+
+        // 3. Try English / International formats inside aria-label: e.g. "Oct 19, 2026" or "19 Oct 2026"
+        var parts = trimmed.Split(['-', '–', '—', ',', ':'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         CultureInfo[] cultures = [new("cs-CZ"), CultureInfo.InvariantCulture, new("en-US"), new("en-GB")];
 
         for (int i = 0; i < parts.Length; i++)

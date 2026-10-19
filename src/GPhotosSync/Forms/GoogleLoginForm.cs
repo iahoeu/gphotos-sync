@@ -54,6 +54,7 @@ public class GoogleLoginForm : Form
         _btnDone.Click += (_, _) =>
         {
             LoginSucceeded = true;
+            _photosEngine.IsKnownLoggedIn = true;
             DialogResult = DialogResult.OK;
             Close();
         };
@@ -111,6 +112,7 @@ public class GoogleLoginForm : Form
             if (hasPhotos == "true")
             {
                 LoginSucceeded = true;
+                _photosEngine.IsKnownLoggedIn = true;
                 _lblStatus.Text = "✓ Přihlášení k Google Photos bylo úspěšně ověřeno! Můžete okno potvrdit tlačítkem vpravo.";
                 _lblStatus.ForeColor = Color.FromArgb(20, 130, 50);
                 _btnDone.BackColor = Color.FromArgb(24, 145, 65);
