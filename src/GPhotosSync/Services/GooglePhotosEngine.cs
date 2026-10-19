@@ -134,6 +134,8 @@ public class DownloadResult
     public bool Success { get; set; }
     public bool SkippedVideo { get; set; }
     public string LocalFileName { get; set; } = string.Empty;
+    /// <summary>Název souboru, jak ho poslal Google (před případným doplněním _1, _2…).</summary>
+    public string OriginalFileName { get; set; } = string.Empty;
     public string FullPath { get; set; } = string.Empty;
     public string FileHash { get; set; } = string.Empty;
     public long FileSize { get; set; }
@@ -1460,6 +1462,7 @@ public class GooglePhotosEngine : IDisposable
                 {
                     Success = true,
                     LocalFileName = Path.GetFileName(finalPath),
+                    OriginalFileName = res.LocalFileName,
                     FullPath = finalPath,
                     FileHash = fileHash,
                     FileSize = fileInfo.Length,

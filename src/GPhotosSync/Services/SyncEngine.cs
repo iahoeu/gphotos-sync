@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using GPhotosSync.Data;
 
 namespace GPhotosSync.Services;
@@ -934,6 +935,106 @@ public class SyncEngine : IDisposable
                ext.Equals(".m2ts", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static readonly Regex DuplicateSuffixRegex = new(@"^(?<base>.+)_(?<n>\d{1,3})(?<ext>\.[^.\\/]+)$", RegexOptions.Compiled);
+    private static readonly TimeSpan MaxDuplicateCollapseDuration = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Po stažení: pokud aplikace musela soubor uložit pod jménem s příponou _1, _2… a ve složce už leží
+    /// soubor původního jména (nebo jiná varianta) se shodným obsahem, který nepatří žádnému jinému záznamu,
+    /// převezme se ten a nově stažená kopie se smaže. Brání duplikátům po přeinstalaci se smazanou evidencí.
+    /// </summary>
+    public static bool TryAdoptIdenticalExistingFile(SyncDatabase db, string folder, DownloadResult res)
+    {
+        if (string.IsNullOrWhiteSpace(res.OriginalFileName) || string.IsNullOrEmpty(res.FileHash) ||
+            string.Equals(res.LocalFileName, res.OriginalFileName, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var baseName = Path.GetFileNameWithoutExtension(res.OriginalFileName);
+        var ext = Path.GetExtension(res.OriginalFileName);
+        var candidates = new List<string> { res.OriginalFileName };
+        for (int n = 1; n <= 50; n++)
+            candidates.Add($"{baseName}_{n}{ext}");
+
+        foreach (var candidate in candidates)
+        {
+            if (string.Equals(candidate, res.LocalFileName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var path = Path.Combine(folder, candidate);
+            if (!File.Exists(path) || db.GetByLocalFileName(candidate) != null)
+                continue;
+
+            long length;
+            try { length = new FileInfo(path).Length; } catch { continue; }
+            if (length != res.FileSize)
+                continue;
+
+            if (!string.Equals(ExifService.ComputeFastFileHash(path), res.FileHash, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            try { File.Delete(res.FullPath); } catch { return false; }
+            Logger.Info($"Soubor '{candidate}' už ve složce je se shodným obsahem – převzat do evidence, duplikát '{res.LocalFileName}' nevznikl.");
+            res.LocalFileName = candidate;
+            res.FullPath = path;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Úklid dříve vzniklých duplikátů: evidovaný soubor "X_N.ext", vedle kterého leží neevidovaný "X.ext"
+    /// se shodným obsahem -> evidence se převede na "X.ext" a kopie "X_N.ext" se smaže. Rozhoduje výhradně
+    /// shoda SHA-256, takže skutečně odlišné fotky (např. sériové snímky "_01") zůstanou nedotčené.
+    /// </summary>
+    public static int CollapseDuplicateDownloads(SyncDatabase db, string folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+            return 0;
+
+        int collapsed = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        foreach (var record in db.GetItemsByStatus(SyncItemStatus.Downloaded))
+        {
+            if (sw.Elapsed > MaxDuplicateCollapseDuration)
+                break;
+
+            var fileName = Path.GetFileName(record.LocalFileName);
+            var match = DuplicateSuffixRegex.Match(fileName);
+            if (!match.Success)
+                continue;
+
+            var dir = Path.GetDirectoryName(record.LocalFileName) ?? string.Empty;
+            var originalRel = Path.Combine(dir, match.Groups["base"].Value + match.Groups["ext"].Value);
+            var dupPath = Path.Combine(folder, record.LocalFileName);
+            var originalPath = Path.Combine(folder, originalRel);
+
+            if (!File.Exists(dupPath) || !File.Exists(originalPath) || db.GetByLocalFileName(originalRel) != null)
+                continue;
+
+            try
+            {
+                if (new FileInfo(dupPath).Length != new FileInfo(originalPath).Length)
+                    continue;
+            }
+            catch { continue; }
+
+            var dupHash = string.IsNullOrEmpty(record.FileHash) ? ExifService.ComputeFastFileHash(dupPath) : record.FileHash;
+            var originalHash = ExifService.ComputeFastFileHash(originalPath);
+            if (string.IsNullOrEmpty(dupHash) || !string.Equals(dupHash, originalHash, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Nejdřív převést evidenci (aby smazání kopie nevyvolalo mazání v Google Photos), pak smazat kopii
+            db.UpdateLocalFileLocationAndHash(record.MediaKey, originalRel, originalHash);
+            try { File.Delete(dupPath); } catch { }
+            collapsed++;
+        }
+
+        if (collapsed > 0)
+            Logger.Info($"Uklizeno {collapsed} duplicitních kopií (soubory se shodným obsahem jako již existující fotky).");
+        return collapsed;
+    }
+
     private const int MaxHashBackfillPerCycle = 100;
     private static readonly TimeSpan MaxHashBackfillDuration = TimeSpan.FromSeconds(2);
 
@@ -1151,6 +1252,8 @@ public class SyncEngine : IDisposable
             }
 
             bool baselineIncomplete = isInitialBaselineCapture && !_config.BaselineCaptured;
+
+            CollapseDuplicateDownloads(_db, _config.DownloadFolder);
 
             var discoveredByKey = new Dictionary<string, DiscoveredMediaItem>(StringComparer.Ordinal);
             string? timelineResumeKey = _db.GetState(StateKeyTimelineResume);
@@ -1439,6 +1542,9 @@ public class SyncEngine : IDisposable
                             if (!item.ForceDownload) lastProcessedMediaKey = item.MediaKey;
                             continue;
                         }
+
+                        // Ve složce už může ležet totožný soubor (např. po přeinstalaci se smazanou evidencí) -> převzít ho
+                        TryAdoptIdenticalExistingFile(_db, cycleDownloadFolder, res);
 
                         _db.UpsertItem(new SyncItemRecord
                         {

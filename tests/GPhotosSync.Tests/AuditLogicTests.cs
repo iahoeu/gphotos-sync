@@ -1037,4 +1037,84 @@ public class AuditLogicTests : IDisposable
     {
         Assert.Equal(expected, GooglePhotosEngine.IsTrashIndicatorText(text));
     }
+
+    // -------------------------------------------------------------------------
+    // Test na VM: přeinstalace se smazanou evidencí nesmí vytvořit duplikáty _1
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void TryAdoptIdenticalExistingFile_ReusesUntrackedIdenticalFile()
+    {
+        var (_, db, dir) = CreateTwoWaySetup("AdoptExisting");
+        var bytes = new byte[] { 5, 6, 7, 8, 9 };
+        File.WriteAllBytes(Path.Combine(dir, "IMG1.jpg"), bytes);     // zůstal po odinstalaci
+        File.WriteAllBytes(Path.Combine(dir, "IMG1_1.jpg"), bytes);   // právě stažený
+        var res = new DownloadResult
+        {
+            Success = true, OriginalFileName = "IMG1.jpg", LocalFileName = "IMG1_1.jpg",
+            FullPath = Path.Combine(dir, "IMG1_1.jpg"), FileSize = bytes.Length, FileHash = Sha(bytes)
+        };
+
+        Assert.True(SyncEngine.TryAdoptIdenticalExistingFile(db, dir, res));
+        Assert.Equal("IMG1.jpg", res.LocalFileName);
+        Assert.False(File.Exists(Path.Combine(dir, "IMG1_1.jpg")));
+    }
+
+    [Fact]
+    public void TryAdoptIdenticalExistingFile_DifferentContentKeepsBothFiles()
+    {
+        var (_, db, dir) = CreateTwoWaySetup("AdoptDifferent");
+        File.WriteAllBytes(Path.Combine(dir, "IMG2.jpg"), new byte[] { 1, 1, 1, 1, 1 });
+        var newBytes = new byte[] { 2, 2, 2, 2, 2 };
+        File.WriteAllBytes(Path.Combine(dir, "IMG2_1.jpg"), newBytes);
+        var res = new DownloadResult
+        {
+            Success = true, OriginalFileName = "IMG2.jpg", LocalFileName = "IMG2_1.jpg",
+            FullPath = Path.Combine(dir, "IMG2_1.jpg"), FileSize = newBytes.Length, FileHash = Sha(newBytes)
+        };
+
+        Assert.False(SyncEngine.TryAdoptIdenticalExistingFile(db, dir, res));
+        Assert.True(File.Exists(Path.Combine(dir, "IMG2.jpg")));
+        Assert.True(File.Exists(Path.Combine(dir, "IMG2_1.jpg")));
+    }
+
+    [Fact]
+    public void TryAdoptIdenticalExistingFile_FileTrackedByOtherRecordIsNotTaken()
+    {
+        var (_, db, dir) = CreateTwoWaySetup("AdoptTracked");
+        var bytes = new byte[] { 3, 3, 3 };
+        File.WriteAllBytes(Path.Combine(dir, "IMG3.jpg"), bytes);
+        File.WriteAllBytes(Path.Combine(dir, "IMG3_1.jpg"), bytes);
+        db.UpsertItem(Record("AF1QipOther_00000000", "IMG3.jpg", 3, Sha(bytes)));
+        var res = new DownloadResult
+        {
+            Success = true, OriginalFileName = "IMG3.jpg", LocalFileName = "IMG3_1.jpg",
+            FullPath = Path.Combine(dir, "IMG3_1.jpg"), FileSize = bytes.Length, FileHash = Sha(bytes)
+        };
+
+        Assert.False(SyncEngine.TryAdoptIdenticalExistingFile(db, dir, res));
+        Assert.Equal("IMG3_1.jpg", res.LocalFileName);
+    }
+
+    [Fact]
+    public void CollapseDuplicateDownloads_MovesRecordToOriginalAndDeletesCopy_KeepsBurstShots()
+    {
+        var (_, db, dir) = CreateTwoWaySetup("Collapse");
+        var photo = new byte[] { 9, 8, 7, 6 };
+        File.WriteAllBytes(Path.Combine(dir, "A.jpg"), photo);        // neevidovaný původní soubor
+        File.WriteAllBytes(Path.Combine(dir, "A_1.jpg"), photo);      // evidovaný duplikát
+        db.UpsertItem(Record("AF1QipDup_0000000000", "A_1.jpg", 4, Sha(photo)));
+
+        var burst1 = new byte[] { 1, 2, 3, 4 };
+        var burst2 = new byte[] { 4, 3, 2, 1 };
+        File.WriteAllBytes(Path.Combine(dir, "B.jpg"), burst1);
+        File.WriteAllBytes(Path.Combine(dir, "B_01.jpg"), burst2);    // jiný sériový snímek
+        db.UpsertItem(Record("AF1QipBurst_00000000", "B_01.jpg", 4, Sha(burst2)));
+
+        Assert.Equal(1, SyncEngine.CollapseDuplicateDownloads(db, dir));
+        Assert.Equal("A.jpg", db.GetByMediaKey("AF1QipDup_0000000000")!.LocalFileName);
+        Assert.False(File.Exists(Path.Combine(dir, "A_1.jpg")));
+        Assert.True(File.Exists(Path.Combine(dir, "B_01.jpg")));
+        Assert.Equal("B_01.jpg", db.GetByMediaKey("AF1QipBurst_00000000")!.LocalFileName);
+    }
 }
