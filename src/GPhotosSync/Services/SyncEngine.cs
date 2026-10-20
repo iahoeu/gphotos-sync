@@ -326,7 +326,7 @@ public class SyncEngine : IDisposable
         var record = _db.GetByLocalFileName(e.Name!);
         if (record != null)
         {
-            Logger.Info($"Zjištěno odebrání/přesunutí souboru '{e.Name}' ze složky PC. Čekám na dokončení operace před kontrolou...");
+            Logger.Debug($"Zjištěno odebrání/přesunutí souboru '{e.Name}' ze složky PC. Čekám na dokončení operace před kontrolou...");
             _photosEngine.InvokeOnUiThread(() =>
             {
                 _deleteDebounceTimer.Stop();
@@ -1361,6 +1361,7 @@ public class SyncEngine : IDisposable
             Logger.Debug($"Nalezeno {discovered.Count} položek ke kontrole z Google Photos.");
 
             var newItems = new List<DiscoveredMediaItem>();
+            int skippedOutOfRange = 0; // souhrn do protokolu místo řádku za každou položku
             foreach (var item in discovered)
             {
                 var existing = _db.GetByMediaKey(item.MediaKey);
@@ -1390,7 +1391,8 @@ public class SyncEngine : IDisposable
 
                 if (cutoffDate.HasValue && item.EstimatedDate.HasValue && item.EstimatedDate.Value.Date < cutoffDate.Value.Date)
                 {
-                    Logger.Info($"Přeskakuji starší položku '{item.MediaKey}' (datum na časové ose {item.EstimatedDate.Value:dd.MM.yyyy} je starší než limit {cutoffDate.Value:dd.MM.yyyy}).");
+                    skippedOutOfRange++;
+                    Logger.Debug($"Přeskakuji starší položku '{item.MediaKey}' (datum na časové ose {item.EstimatedDate.Value:dd.MM.yyyy} je starší než limit {cutoffDate.Value:dd.MM.yyyy}).");
                     _db.UpsertItem(new SyncItemRecord
                     {
                         MediaKey = item.MediaKey,
@@ -1464,7 +1466,8 @@ public class SyncEngine : IDisposable
 
                     if (!item.ForceDownload && cutoffDate.HasValue && item.EstimatedDate.HasValue && item.EstimatedDate.Value.Date < cutoffDate.Value.Date)
                     {
-                        Logger.Info($"Přeskakuji starší položku '{item.MediaKey}' podle nově upraveného nastavení ({item.EstimatedDate.Value:dd.MM.yyyy} < {cutoffDate.Value:dd.MM.yyyy}).");
+                        skippedOutOfRange++;
+                        Logger.Debug($"Přeskakuji starší položku '{item.MediaKey}' podle nově upraveného nastavení ({item.EstimatedDate.Value:dd.MM.yyyy} < {cutoffDate.Value:dd.MM.yyyy}).");
                         _db.UpsertItem(new SyncItemRecord
                         {
                             MediaKey = item.MediaKey,
@@ -1527,7 +1530,8 @@ public class SyncEngine : IDisposable
                             res.TakenAt.HasValue &&
                             res.TakenAt.Value.Date < cutoffDate.Value.Date)
                         {
-                            Logger.Info($"Přeskakuji stažený soubor '{res.LocalFileName}' – EXIF datum pořízení ({res.TakenAt.Value:dd.MM.yyyy}) je starší než zvolený limit ({cutoffDate.Value:dd.MM.yyyy}).");
+                            skippedOutOfRange++;
+                            Logger.Debug($"Přeskakuji stažený soubor '{res.LocalFileName}' – EXIF datum pořízení ({res.TakenAt.Value:dd.MM.yyyy}) je starší než zvolený limit ({cutoffDate.Value:dd.MM.yyyy}).");
                             try { File.Delete(res.FullPath); } catch { }
                             _db.UpsertItem(new SyncItemRecord
                             {
@@ -1569,6 +1573,11 @@ public class SyncEngine : IDisposable
                         Logger.Warn($"Nepodařilo se stáhnout položku '{item.MediaKey}': {res.ErrorMessage}");
                     }
                 }
+            }
+
+            if (skippedOutOfRange > 0)
+            {
+                Logger.Info($"Přeskočeno {skippedOutOfRange} položek mimo zvolený časový rozsah (starší než limit).");
             }
 
             // Bod 10a: Uložit nebo vyčistit pozici rozpracovaného skenu mezi cykly
