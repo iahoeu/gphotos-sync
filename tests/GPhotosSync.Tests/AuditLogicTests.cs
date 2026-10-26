@@ -996,11 +996,13 @@ public class AuditLogicTests : IDisposable
         deleted.UpdatedAt = now.AddMinutes(-1); // hned po smazání se ještě nevyhodnocuje
         Assert.False(SyncEngine.IsReappearedAfterRemoteDelete(deleted, now));
 
+        // Nepotvrzené smazání (DeleteUnconfirmed) znamená, že přesun do koše nebyl potvrzen a fotka pravděpodobně
+        // vůbec neopustila knihovnu -> její přítomnost na časové ose NENÍ obnovením z koše a nesmí se znovu stahovat.
         var unconfirmed = Record("AF1QipUnconfirmed_00", "b.jpg", 4);
         unconfirmed.Status = SyncItemStatus.SkippedInitial;
         unconfirmed.SkipReason = SkipReason.DeleteUnconfirmed;
         unconfirmed.UpdatedAt = now.AddMinutes(-30);
-        Assert.True(SyncEngine.IsReappearedAfterRemoteDelete(unconfirmed, now));
+        Assert.False(SyncEngine.IsReappearedAfterRemoteDelete(unconfirmed, now));
 
         var baseline = Record("AF1QipBaseline_00000", "", 0);
         baseline.Status = SyncItemStatus.SkippedInitial;
@@ -1010,6 +1012,21 @@ public class AuditLogicTests : IDisposable
 
         var downloaded = Record("AF1QipDownloaded_000", "c.jpg", 4);
         Assert.False(SyncEngine.IsReappearedAfterRemoteDelete(downloaded, now));
+    }
+
+    [Theory]
+    [InlineData("Přesunout do koše", true)]
+    [InlineData("Smazat", true)]
+    [InlineData("Rozumím, pokračovat", true)]
+    [InlineData("  Rozumím,\u00A0pokračovat  ", true)]
+    [InlineData("Got it, continue", true)]
+    [InlineData("Move to trash", true)]
+    [InlineData("Zrušit", false)]
+    [InlineData("Cancel", false)]
+    [InlineData("Další informace", false)]
+    public void IsTrashDialogConfirmButtonText_MatchesStandardAndPolicyConfirmButtons(string text, bool expected)
+    {
+        Assert.Equal(expected, GooglePhotosEngine.IsTrashDialogConfirmButtonText(text));
     }
 
     [Fact]

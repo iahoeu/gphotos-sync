@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -12,10 +12,10 @@
     <AssemblyName>GPhotosSync</AssemblyName>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <RootNamespace>GPhotosSync</RootNamespace>
-    <Version>1.0.12</Version>
+    <Version>1.0.13</Version>
     <Product>Google Photos Sync pro Windows</Product>
     <Company>GPhotosSync</Company>
-    <Description>Automatická obousměrná synchronizace fotek a videí z Google Photos do složky ve Windows</Description>
+    <Description>AutomatickĂˇ obousmÄ›rnĂˇ synchronizace fotek a videĂ­ z Google Photos do sloĹľky ve Windows</Description>
   </PropertyGroup>
 
   <ItemGroup>

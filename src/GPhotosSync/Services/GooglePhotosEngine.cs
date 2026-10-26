@@ -1624,8 +1624,13 @@ public class GooglePhotosEngine : IDisposable
             await Task.Delay(800, ct);
 
             // 2. P0-4 & P1-5: Najít a potvrdit výhradně modální potvrzovací dialog přesunu do koše (žádný Enter naslepo!)
+            // U účtů, které ještě neodklikly změnu politiky koše (60 -> 30 dní), Google Photos zobrazuje dialog
+            // „Na obnovení položek z koše teď máte 30 dní...“ s tlačítkem „Rozumím, pokračovat“ („Got it, continue“).
             bool dialogConfirmed = false;
-            for (int attempt = 0; attempt < 6; attempt++)
+            bool policyDialogConfirmed = false;
+            int noDialogAfterPolicyCount = 0;
+
+            for (int attempt = 0; attempt < 8; attempt++)
             {
                 var confirmScript = $@"
                     (() => {{
@@ -1642,16 +1647,18 @@ public class GooglePhotosEngine : IDisposable
                             const buttons = Array.from(dlg.querySelectorAll('button, [role=""button""]'))
                                 .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
                             const confirmBtn = buttons.find(b => {{
-                                const t = (b.innerText || b.getAttribute('aria-label') || '').trim();
-                                return /^(Přesunout do koše|Smazat|Move to trash|Move to bin|Delete)$/i.test(t);
-                            }}) || dlg.querySelector('button[data-mdc-dialog-action=""ok""]');
+                                const t = (b.innerText || b.textContent || b.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+                                return /^(Přesunout do koše|Smazat|Move to trash|Move to bin|Delete|Rozumím,\s*pokračovat|Rozumím|Pokračovat|Got it,\s*continue|Got it|Continue)$/i.test(t);
+                            }}) || dlg.querySelector('button[data-mdc-dialog-action=""ok""], button[data-mdc-dialog-action=""accept""]');
 
                             if (confirmBtn) {{
+                                const btnText = (confirmBtn.innerText || confirmBtn.textContent || confirmBtn.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
                                 confirmBtn.click();
-                                return 'CONFIRMED';
+                                const isPolicy = /^(Rozumím|Pokračovat|Got it|Continue)/i.test(btnText);
+                                return isPolicy ? 'CONFIRMED_POLICY' : 'CONFIRMED';
                             }}
                         }}
-                        return 'WAITING';
+                        return dialogs.length > 0 ? 'WAITING_WITH_DIALOG' : 'WAITING_NO_DIALOG';
                     }})();
                 ";
 
@@ -1663,11 +1670,29 @@ public class GooglePhotosEngine : IDisposable
                     dialogConfirmed = true;
                     break;
                 }
+                if (confirmStatus == "CONFIRMED_POLICY")
+                {
+                    dialogConfirmed = true;
+                    policyDialogConfirmed = true;
+                    noDialogAfterPolicyCount = 0;
+                    Logger.Info($"Potvrzen informační dialog koše Google Photos ('Rozumím, pokračovat') u položky '{mediaKey}'.");
+                    await Task.Delay(700, ct);
+                    continue;
+                }
                 if (confirmStatus.StartsWith("ERR_", StringComparison.Ordinal))
                 {
                     // Např. Google Photos přesunulo fotku do koše rovnou bez dialogu a přešlo na další -> ověřit výsledek
-                    Logger.Warn($"Potvrzovací dialog pro '{mediaKey}' se nezobrazil ({confirmStatus}) – ověřuji výsledek.");
+                    if (!dialogConfirmed)
+                    {
+                        Logger.Warn($"Potvrzovací dialog pro '{mediaKey}' se nezobrazil ({confirmStatus}) – ověřuji výsledek.");
+                    }
                     break;
+                }
+                if (policyDialogConfirmed && confirmStatus == "WAITING_NO_DIALOG")
+                {
+                    noDialogAfterPolicyCount++;
+                    if (noDialogAfterPolicyCount >= 2)
+                        break;
                 }
 
                 await Task.Delay(450, ct);
@@ -1683,6 +1708,7 @@ public class GooglePhotosEngine : IDisposable
             // 3. Bod 9: Ověřit skutečný výsledek přesunu do koše.
             // Pouhé opuštění URL NENÍ důkazem smazání! Vyžadujeme buď toast „Přesunuto do koše“,
             // nebo následné ověření nedostupnosti položky při novém načtení její URL.
+            bool retriedTrashAfterPolicyDialog = false;
             for (int verifyAttempt = 0; verifyAttempt < 10; verifyAttempt++)
             {
                 await Task.Delay(500, ct);
@@ -1744,6 +1770,46 @@ public class GooglePhotosEngine : IDisposable
                         {
                             // URL se změnila (např. přechod na další fotku), ale toast jsme nezachytili -> přejdeme rovnou na ověření přes opětovné načtení URL
                             break;
+                        }
+
+                        // Pokud odkliknutí 'Rozumím, pokračovat' pouze zavřelo informační dialog o 30 dnech a fotka zůstala otevřená
+                        // na stejné URL bez přesunu do koše, klikneme na ikonu koše a potvrdíme standardní dialog.
+                        if (policyDialogConfirmed && !retriedTrashAfterPolicyDialog && verifyAttempt >= 2)
+                        {
+                            retriedTrashAfterPolicyDialog = true;
+                            var retryClickRaw = await _webView.CoreWebView2.ExecuteScriptAsync(clickTrashScript);
+                            var retryClickStatus = JsonSerializer.Deserialize<string>(retryClickRaw ?? "\"\"") ?? "";
+                            if (retryClickStatus == "CLICKED")
+                            {
+                                Logger.Info($"Po odkliknutí informačního dialogu o 30 dnech opakuji kliknutí na koš pro '{mediaKey}'.");
+                                await Task.Delay(600, ct);
+                                for (int subAttempt = 0; subAttempt < 5; subAttempt++)
+                                {
+                                    var subConfirmRaw = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                                        (() => {
+                                            const dialogs = Array.from(document.querySelectorAll('[role=""dialog""], [role=""alertdialog""], .VfPpkd-P5QLlc'))
+                                                .filter(d => d.offsetParent !== null || d.getBoundingClientRect().width > 0);
+                                            for (const dlg of dialogs) {
+                                                const buttons = Array.from(dlg.querySelectorAll('button, [role=""button""]'))
+                                                    .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
+                                                const confirmBtn = buttons.find(b => {
+                                                    const t = (b.innerText || b.textContent || b.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+                                                    return /^(Přesunout do koše|Smazat|Move to trash|Move to bin|Delete|Rozumím,\s*pokračovat|Rozumím|Pokračovat|Got it,\s*continue|Got it|Continue)$/i.test(t);
+                                                }) || dlg.querySelector('button[data-mdc-dialog-action=""ok""], button[data-mdc-dialog-action=""accept""]');
+                                                if (confirmBtn) {
+                                                    confirmBtn.click();
+                                                    return 'CONFIRMED';
+                                                }
+                                            }
+                                            return 'WAITING';
+                                        })();
+                                    ");
+                                    var subConfirmStatus = JsonSerializer.Deserialize<string>(subConfirmRaw ?? "\"\"") ?? "";
+                                    if (subConfirmStatus == "CONFIRMED")
+                                        break;
+                                    await Task.Delay(400, ct);
+                                }
+                            }
                         }
                     }
                 }
@@ -1824,6 +1890,21 @@ public class GooglePhotosEngine : IDisposable
         {
             return $"(snímek se nepodařilo pořídit: {ex.Message})";
         }
+    }
+
+    /// <summary>
+    /// Potvrzovací tlačítko v dialogu mazání Google Photos – buď standardní „Přesunout do koše“ / „Smazat“,
+    /// nebo informační dialog o 30denní lhůtě v koši s tlačítkem „Rozumím, pokračovat“ („Got it, continue“).
+    /// </summary>
+    public static bool IsTrashDialogConfirmButtonText(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        var normalized = Regex.Replace(text, @"\s+", " ").Trim();
+        return Regex.IsMatch(normalized,
+            @"^(Přesunout do koše|Smazat|Move to trash|Move to bin|Delete|Rozumím,\s*pokračovat|Rozumím|Pokračovat|Got it,\s*continue|Got it|Continue)$",
+            RegexOptions.IgnoreCase);
     }
 
     /// <summary>

@@ -914,14 +914,14 @@ public class SyncEngine : IDisposable
     }
 
     /// <summary>
-    /// Položka, kterou aplikace přesunula do koše (nebo se o to pokusila), se znovu objevila v knihovně
+    /// Položka, kterou aplikace ověřeně přesunula do koše, se znovu objevila v knihovně
     /// Google Photos -> uživatel ji obnovil z koše a chce ji zpět. Krátce po smazání se nevyhodnocuje
-    /// (stránka může ještě chvíli zobrazovat starý stav).
+    /// (stránka může ještě chvíli zobrazovat starý stav). Položky s nepotvrzeným smazáním (DeleteUnconfirmed)
+    /// z knihovny pravděpodobně vůbec nezmizely, proto se jako „obnovené z koše“ nevyhodnocují.
     /// </summary>
     public static bool IsReappearedAfterRemoteDelete(SyncItemRecord record, DateTime now)
     {
-        bool wasRemoteDeleted = record.Status == SyncItemStatus.DeletedLocalAndRemote ||
-                                (record.Status == SyncItemStatus.SkippedInitial && record.SkipReason == SkipReason.DeleteUnconfirmed);
+        bool wasRemoteDeleted = record.Status == SyncItemStatus.DeletedLocalAndRemote;
         return wasRemoteDeleted && (now - record.UpdatedAt) > TimeSpan.FromMinutes(5);
     }
 
