@@ -124,6 +124,8 @@ public class AccountCheckResult
 {
     public bool IsLoggedIn { get; set; }
     public bool IsAccountVerifiedForDelete { get; set; }
+    public bool IsNavigationError { get; set; }
+    public bool WasSilentlyRefreshed { get; set; }
     public string? DetectedEmail { get; set; }
     public string? ErrorMessage { get; set; }
     public string? DeleteBlockedReason { get; set; }
@@ -229,6 +231,10 @@ internal sealed class OffScreenBrowserForm : Form
 
 public class GooglePhotosEngine : IDisposable
 {
+    public const string PhotosHomeUrl = "https://photos.google.com/";
+    public const string SilentServiceLoginUrl = "https://accounts.google.com/ServiceLogin?service=lh2&passive=true&continue=https%3A%2F%2Fphotos.google.com%2F";
+    private static readonly TimeSpan SilentKeepAliveInterval = TimeSpan.FromHours(6);
+
     private readonly OffScreenBrowserForm _hostForm;
     private readonly WebView2 _webView;
     private CoreWebView2Environment? _env;
@@ -237,6 +243,7 @@ public class GooglePhotosEngine : IDisposable
     private bool _isKnownLoggedIn;
     private string? _lastVerifiedEmail;
     private string? _manuallyConfirmedSessionEmail;
+    private DateTime _lastSilentKeepAliveUtc = DateTime.MinValue;
 
     public string? LastVerifiedEmail => _lastVerifiedEmail;
 
@@ -388,8 +395,11 @@ public class GooglePhotosEngine : IDisposable
     }
 
     /// <summary>
-    /// P1-8 & Bod 8 (Doplněk): Přísná kontrola přihlášení a shody Google účtu.
-    /// - Při výjimce nebo neprůkazném výsledku VŽDY vrací IsLoggedIn = false.
+    /// P1-8 & Bod 8 (Doplněk): Přísná kontrola přihlášení a shody Google účtu s automatickou tichou obnovou relace.
+    /// - Dílčí relace na photos.google.com (cookie OSID) vyprší zhruba po 7 dnech, i když hlavní přihlášení
+    ///   na accounts.google.com stále platí. Pokud je stránka přesměrována na /about nebo vyžaduje přihlášení,
+    ///   aplikace nejprve provede tichý průchod přes accounts.google.com (ServiceLogin?passive=true), který
+    ///   relaci bez zásahu uživatele obnoví.
     /// - Mazání (IsAccountVerifiedForDelete) je povolené VÝHRADNĚ tehdy, když je vyplněn ExpectedGoogleAccountEmail
     ///   a podařilo se jej ověřit ze stránky (nebo jej uživatel pro tuto aktivní relaci výslovně potvrdil).
     /// </summary>
@@ -399,156 +409,73 @@ public class GooglePhotosEngine : IDisposable
         try
         {
             await EnsureInitializedAsync();
-            bool navOk = await NavigateAndWaitForDomAsync("https://photos.google.com/", 12000);
-            if (!navOk)
+
+            // Pravidelné tiché oživení relace (každých 6 hodin), aby nevypršely rotační cookies (*PSIDTS, OSID)
+            if (_isKnownLoggedIn && DateTime.UtcNow - _lastSilentKeepAliveUtc >= SilentKeepAliveInterval)
             {
-                _isKnownLoggedIn = false;
-                _manuallyConfirmedSessionEmail = null;
-                return new AccountCheckResult
-                {
-                    IsLoggedIn = false,
-                    IsAccountVerifiedForDelete = false,
-                    ErrorMessage = "Nepodařilo se načíst stránku Google Photos (navigace selhala nebo vypršel časový limit)."
-                };
+                Logger.Debug("Provádím preventivní tiché oživení přihlašovací relace Google...");
+                await NavigateAndWaitForDomAsync(SilentServiceLoginUrl, 12000);
+                _lastSilentKeepAliveUtc = DateTime.UtcNow;
             }
 
-            for (int attempt = 0; attempt < 6; attempt++)
+            var currentUrl = _webView.CoreWebView2.Source ?? "";
+            if (!currentUrl.StartsWith(PhotosHomeUrl, StringComparison.OrdinalIgnoreCase) || IsLoginOrMarketingUrl(currentUrl))
             {
-                await Task.Delay(700);
-                var url = _webView.CoreWebView2.Source ?? "";
-                if (IsLoginOrMarketingUrl(url))
+                bool navOk = await NavigateAndWaitForDomAsync(PhotosHomeUrl, 12000);
+                if (!navOk)
                 {
                     _isKnownLoggedIn = false;
-                    _manuallyConfirmedSessionEmail = null;
+                    // Při chybě sítě/navigace nemazat _manuallyConfirmedSessionEmail (nejde o odhlášení účtu)
                     return new AccountCheckResult
                     {
                         IsLoggedIn = false,
                         IsAccountVerifiedForDelete = false,
-                        ErrorMessage = "Uživatel není přihlášen ke Google Photos."
+                        IsNavigationError = true,
+                        ErrorMessage = "Nepodařilo se načíst stránku Google Photos (navigace selhala nebo vypršel časový limit)."
                     };
                 }
-
-                var checkJs = @"
-                    (() => {
-                        const hasPhotos = document.querySelectorAll('a[href*=""/photo/""], a[href*=""photo/""]').length > 0;
-                        const hasAppShell = document.querySelector('c-wiz') !== null &&
-                                            (document.querySelector('input[aria-label]') !== null ||
-                                             document.querySelector('a[aria-label*=""Google""]') !== null ||
-                                             document.querySelector('button[aria-label*=""Google""]') !== null ||
-                                             document.querySelector('img[src*=""googleusercontent""]') !== null ||
-                                             document.querySelector('[role=""main""]') !== null);
-                        const hasSignInBtn = Array.from(document.querySelectorAll('a, button'))
-                            .some(el => /^(Přihlásit se|Sign in|Přejít do Fotek Google|Go to Google Photos)$/i.test((el.innerText || '').trim()));
-                        if (hasSignInBtn && !hasPhotos) {
-                            return JSON.stringify({ loggedIn: false, email: '' });
-                        }
-
-                        let email = '';
-                        const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
-                        const accountEls = Array.from(document.querySelectorAll('a[aria-label*=""@""], button[aria-label*=""@""], div[aria-label*=""@""], [data-email]'));
-                        for (const el of accountEls) {
-                            const dataEmail = el.getAttribute('data-email') || '';
-                            if (emailRegex.test(dataEmail)) {
-                                email = dataEmail.match(emailRegex)[1];
-                                break;
-                            }
-                            const aria = el.getAttribute('aria-label') || '';
-                            const m = aria.match(emailRegex);
-                            if (m) {
-                                email = m[1];
-                                break;
-                            }
-                        }
-
-                        if (!email) {
-                            const scripts = Array.from(document.querySelectorAll('script'));
-                            for (const s of scripts) {
-                                const txt = s.textContent || '';
-                                if (txt.includes('WIZ_global_data') || txt.includes('AF_initDataCallback')) {
-                                    const m = txt.match(/""([a-zA-Z0-9._%+-]+@(?:gmail\.com|googlemail\.com|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))""/);
-                                    if (m) {
-                                        email = m[1];
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        return JSON.stringify({
-                            loggedIn: !!(hasPhotos || hasAppShell),
-                            email: email || ''
-                        });
-                    })();
-                ";
-
-                var rawJson = await _webView.CoreWebView2.ExecuteScriptAsync(checkJs);
-                if (!string.IsNullOrWhiteSpace(rawJson) && rawJson != "null")
+            }
+            else
+            {
+                bool navOk = await NavigateAndWaitForDomAsync(PhotosHomeUrl, 12000);
+                if (!navOk)
                 {
-                    var innerJson = JsonSerializer.Deserialize<string>(rawJson);
-                    if (!string.IsNullOrWhiteSpace(innerJson))
+                    _isKnownLoggedIn = false;
+                    return new AccountCheckResult
                     {
-                        using var doc = JsonDocument.Parse(innerJson);
-                        bool isLogged = doc.RootElement.GetProperty("loggedIn").GetBoolean();
-                        string email = doc.RootElement.TryGetProperty("email", out var em) ? (em.GetString() ?? "").Trim() : "";
+                        IsLoggedIn = false,
+                        IsAccountVerifiedForDelete = false,
+                        IsNavigationError = true,
+                        ErrorMessage = "Nepodařilo se načíst stránku Google Photos (navigace selhala nebo vypršel časový limit)."
+                    };
+                }
+            }
 
-                        if (isLogged)
-                        {
-                            var cleanExpected = expectedEmail?.Trim() ?? "";
+            var initialProbe = await ProbePhotosLoginWithWaitAsync(expectedEmail, maxAttempts: 6);
+            if (initialProbe.IsLoggedIn || initialProbe.IsAccountMismatch)
+            {
+                if (initialProbe.IsLoggedIn && _lastSilentKeepAliveUtc == DateTime.MinValue)
+                {
+                    _lastSilentKeepAliveUtc = DateTime.UtcNow;
+                }
+                return initialProbe.Result;
+            }
 
-                            if (!string.IsNullOrWhiteSpace(email))
-                            {
-                                _lastVerifiedEmail = email;
-
-                                if (!string.IsNullOrWhiteSpace(cleanExpected) &&
-                                    !string.Equals(cleanExpected, email, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    _isKnownLoggedIn = false;
-                                    _manuallyConfirmedSessionEmail = null;
-                                    var mismatchMsg = $"Přihlášený účet Google ({email}) neodpovídá dříve nastavenému účtu ({cleanExpected}). Synchronizace a mazání byly zastaveny.";
-                                    Logger.Error(mismatchMsg);
-                                    return new AccountCheckResult
-                                    {
-                                        IsLoggedIn = false,
-                                        IsAccountVerifiedForDelete = false,
-                                        DetectedEmail = email,
-                                        ErrorMessage = mismatchMsg
-                                    };
-                                }
-
-                                _isKnownLoggedIn = true;
-                                bool verifiedForDelete = !string.IsNullOrWhiteSpace(cleanExpected) &&
-                                                         string.Equals(cleanExpected, email, StringComparison.OrdinalIgnoreCase);
-
-                                return new AccountCheckResult
-                                {
-                                    IsLoggedIn = true,
-                                    IsAccountVerifiedForDelete = verifiedForDelete,
-                                    DetectedEmail = email,
-                                    DeleteBlockedReason = verifiedForDelete ? null : "E-mail účtu Google zatím nebyl uložen v konfiguraci."
-                                };
-                            }
-
-                            // E-mail se ze stránky nepodařilo vyčíst (Bod 8 + Doplněk):
-                            _isKnownLoggedIn = true;
-
-                            bool isManuallyConfirmedForExpected =
-                                !string.IsNullOrWhiteSpace(cleanExpected) &&
-                                !string.IsNullOrWhiteSpace(_manuallyConfirmedSessionEmail) &&
-                                string.Equals(cleanExpected, _manuallyConfirmedSessionEmail, StringComparison.OrdinalIgnoreCase);
-
-                            return new AccountCheckResult
-                            {
-                                IsLoggedIn = true,
-                                IsAccountVerifiedForDelete = isManuallyConfirmedForExpected,
-                                DetectedEmail = isManuallyConfirmedForExpected ? cleanExpected : null,
-                                DeleteBlockedReason = isManuallyConfirmedForExpected
-                                    ? null
-                                    : string.IsNullOrWhiteSpace(cleanExpected)
-                                        ? "Mazání v cloudu je vypnuté: není nastaven a potvrzen e-mail účtu Google (potvrďte účet v menu u ikony v liště)."
-                                        : $"Mazání v cloudu je pozastaveno: ze stránky Google Photos se nepodařilo automaticky ověřit e-mail účtu '{cleanExpected}'. Potvrďte účet v menu u ikony v liště."
-                            };
-                        }
+            // Dílčí relace na photos.google.com vypršela (např. po 7 dnech přesměrování na /about) ->
+            // zkusit tiché obnovení přes hlavní relaci accounts.google.com (ServiceLogin?passive=true)
+            bool refreshed = await TrySilentSessionRefreshCoreAsync(expectedEmail);
+            if (refreshed)
+            {
+                var afterRefreshProbe = await ProbePhotosLoginWithWaitAsync(expectedEmail, maxAttempts: 6);
+                if (afterRefreshProbe.IsLoggedIn || afterRefreshProbe.IsAccountMismatch)
+                {
+                    if (afterRefreshProbe.IsLoggedIn)
+                    {
+                        _lastSilentKeepAliveUtc = DateTime.UtcNow;
+                        afterRefreshProbe.Result.WasSilentlyRefreshed = true;
+                        Logger.Info("Přihlašovací relace Google Photos byla automaticky tiše obnovena přes účet Google.");
                     }
+                    return afterRefreshProbe.Result;
                 }
             }
 
@@ -558,18 +485,18 @@ public class GooglePhotosEngine : IDisposable
             {
                 IsLoggedIn = false,
                 IsAccountVerifiedForDelete = false,
-                ErrorMessage = "Nepodařilo se průkazně ověřit přihlášení ke Google Photos."
+                ErrorMessage = "Uživatel není přihlášen ke Google Photos."
             };
         }
         catch (Exception ex)
         {
             Logger.Warn($"Kontrola přihlášení selhala: {ex.Message}");
             _isKnownLoggedIn = false;
-            _manuallyConfirmedSessionEmail = null;
             return new AccountCheckResult
             {
                 IsLoggedIn = false,
                 IsAccountVerifiedForDelete = false,
+                IsNavigationError = true,
                 ErrorMessage = $"Chyba při ověřování přihlášení: {ex.Message}"
             };
         }
@@ -579,7 +506,403 @@ public class GooglePhotosEngine : IDisposable
         }
     }
 
-    private static bool IsLoginOrMarketingUrl(string url)
+    private async Task<(bool IsLoggedIn, bool IsAccountMismatch, AccountCheckResult Result)> ProbePhotosLoginWithWaitAsync(
+        string? expectedEmail,
+        int maxAttempts)
+    {
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            await Task.Delay(700);
+            var url = _webView.CoreWebView2.Source ?? "";
+
+            if (IsLoginOrMarketingUrl(url))
+            {
+                // Pokud prohlížeč zrovna prochází přes accounts.google.com během automatického přesměrování,
+                // neukončovat kontrolu v prvním kroku a počkat na dokončení přesměrování.
+                if (ShouldKeepWaitingForAuthRedirect(url, attempt, maxRedirectWaitAttempts: 4))
+                {
+                    continue;
+                }
+
+                break;
+            }
+
+            var (isLogged, hasExplicitSignInBtn, email) = await EvaluatePhotosDomLoginStateAsync();
+            if (hasExplicitSignInBtn && !isLogged)
+            {
+                break;
+            }
+
+            if (isLogged)
+            {
+                var cleanExpected = expectedEmail?.Trim() ?? "";
+
+                if (!string.IsNullOrWhiteSpace(email))
+                {
+                    _lastVerifiedEmail = email;
+
+                    if (!string.IsNullOrWhiteSpace(cleanExpected) &&
+                        !string.Equals(
+                            SyncEngine.NormalizeGoogleEmail(cleanExpected),
+                            SyncEngine.NormalizeGoogleEmail(email),
+                            StringComparison.Ordinal))
+                    {
+                        _isKnownLoggedIn = false;
+                        _manuallyConfirmedSessionEmail = null;
+                        var mismatchMsg = $"Přihlášený účet Google ({email}) neodpovídá dříve nastavenému účtu ({cleanExpected}). Synchronizace a mazání byly zastaveny.";
+                        Logger.Error(mismatchMsg);
+                        return (false, true, new AccountCheckResult
+                        {
+                            IsLoggedIn = false,
+                            IsAccountVerifiedForDelete = false,
+                            DetectedEmail = email,
+                            ErrorMessage = mismatchMsg
+                        });
+                    }
+
+                    _isKnownLoggedIn = true;
+                    bool verifiedForDelete = !string.IsNullOrWhiteSpace(cleanExpected) &&
+                                             string.Equals(
+                                                 SyncEngine.NormalizeGoogleEmail(cleanExpected),
+                                                 SyncEngine.NormalizeGoogleEmail(email),
+                                                 StringComparison.Ordinal);
+
+                    return (true, false, new AccountCheckResult
+                    {
+                        IsLoggedIn = true,
+                        IsAccountVerifiedForDelete = verifiedForDelete,
+                        DetectedEmail = email,
+                        DeleteBlockedReason = verifiedForDelete ? null : "E-mail účtu Google zatím nebyl uložen v konfiguraci."
+                    });
+                }
+
+                // E-mail se ze stránky nepodařilo vyčíst (Bod 8 + Doplněk):
+                _isKnownLoggedIn = true;
+
+                bool isManuallyConfirmedForExpected =
+                    !string.IsNullOrWhiteSpace(cleanExpected) &&
+                    !string.IsNullOrWhiteSpace(_manuallyConfirmedSessionEmail) &&
+                    string.Equals(
+                        SyncEngine.NormalizeGoogleEmail(cleanExpected),
+                        SyncEngine.NormalizeGoogleEmail(_manuallyConfirmedSessionEmail),
+                        StringComparison.Ordinal);
+
+                return (true, false, new AccountCheckResult
+                {
+                    IsLoggedIn = true,
+                    IsAccountVerifiedForDelete = isManuallyConfirmedForExpected,
+                    DetectedEmail = isManuallyConfirmedForExpected ? cleanExpected : null,
+                    DeleteBlockedReason = isManuallyConfirmedForExpected
+                        ? null
+                        : string.IsNullOrWhiteSpace(cleanExpected)
+                            ? "Mazání v cloudu je vypnuté: není nastaven a potvrzen e-mail účtu Google (potvrďte účet v menu u ikony v liště)."
+                            : $"Mazání v cloudu je pozastaveno: ze stránky Google Photos se nepodařilo automaticky ověřit e-mail účtu '{cleanExpected}'. Potvrďte účet v menu u ikony v liště."
+                });
+            }
+        }
+
+        return (false, false, new AccountCheckResult
+        {
+            IsLoggedIn = false,
+            IsAccountVerifiedForDelete = false,
+            ErrorMessage = "Uživatel není přihlášen ke Google Photos."
+        });
+    }
+
+    private async Task<(bool IsLoggedIn, bool HasExplicitSignInBtn, string Email)> EvaluatePhotosDomLoginStateAsync()
+    {
+        const string checkJs = @"
+            (() => {
+                const hasPhotos = document.querySelectorAll('a[href*=""/photo/""], a[href*=""photo/""]').length > 0;
+                const hasAppShell = document.querySelector('c-wiz') !== null &&
+                                    (document.querySelector('input[aria-label]') !== null ||
+                                     document.querySelector('a[aria-label*=""Google""]') !== null ||
+                                     document.querySelector('button[aria-label*=""Google""]') !== null ||
+                                     document.querySelector('img[src*=""googleusercontent""]') !== null ||
+                                     document.querySelector('[role=""main""]') !== null);
+                const hasSignInBtn = Array.from(document.querySelectorAll('a, button'))
+                    .some(el => /^(Přihlásit se|Sign in|Přejít do Fotek Google|Go to Google Photos)$/i.test((el.innerText || '').trim()));
+                if (hasSignInBtn && !hasPhotos) {
+                    return JSON.stringify({ loggedIn: false, hasSignInBtn: true, email: '' });
+                }
+
+                let email = '';
+                const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
+                const accountEls = Array.from(document.querySelectorAll('a[aria-label*=""@""], button[aria-label*=""@""], div[aria-label*=""@""], [data-email]'));
+                for (const el of accountEls) {
+                    const dataEmail = el.getAttribute('data-email') || '';
+                    if (emailRegex.test(dataEmail)) {
+                        email = dataEmail.match(emailRegex)[1];
+                        break;
+                    }
+                    const aria = el.getAttribute('aria-label') || '';
+                    const m = aria.match(emailRegex);
+                    if (m) {
+                        email = m[1];
+                        break;
+                    }
+                }
+
+                if (!email && window.WIZ_global_data && typeof window.WIZ_global_data === 'object') {
+                    const wizEmail = window.WIZ_global_data.oPEP7c;
+                    if (typeof wizEmail === 'string' && emailRegex.test(wizEmail)) {
+                        email = wizEmail.match(emailRegex)[1];
+                    } else {
+                        for (const val of Object.values(window.WIZ_global_data)) {
+                            if (typeof val === 'string' && val.length <= 120 && emailRegex.test(val)) {
+                                const m = val.match(emailRegex);
+                                if (m && !m[1].endsWith('.gserviceaccount.com')) {
+                                    email = m[1];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!email) {
+                    const scripts = Array.from(document.querySelectorAll('script'));
+                    for (const s of scripts) {
+                        const txt = s.textContent || '';
+                        if (txt.includes('WIZ_global_data') || txt.includes('AF_initDataCallback')) {
+                            const m = txt.match(/""([a-zA-Z0-9._%+-]+@(?:gmail\.com|googlemail\.com|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}))""/);
+                            if (m) {
+                                email = m[1];
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                return JSON.stringify({
+                    loggedIn: !!(hasPhotos || hasAppShell),
+                    hasSignInBtn: hasSignInBtn,
+                    email: email || ''
+                });
+            })();
+        ";
+
+        var rawJson = await _webView.CoreWebView2.ExecuteScriptAsync(checkJs);
+        if (!string.IsNullOrWhiteSpace(rawJson) && rawJson != "null")
+        {
+            var innerJson = JsonSerializer.Deserialize<string>(rawJson);
+            if (!string.IsNullOrWhiteSpace(innerJson))
+            {
+                using var doc = JsonDocument.Parse(innerJson);
+                bool isLogged = doc.RootElement.GetProperty("loggedIn").GetBoolean();
+                bool hasSignInBtn = doc.RootElement.TryGetProperty("hasSignInBtn", out var sb) && sb.GetBoolean();
+                string email = doc.RootElement.TryGetProperty("email", out var em) ? (em.GetString() ?? "").Trim() : "";
+                return (isLogged, hasSignInBtn, email);
+            }
+        }
+
+        return (false, false, string.Empty);
+    }
+
+    /// <summary>
+    /// Pokusí se tiše obnovit relaci Google Photos přes hlavní relaci účtu Google (accounts.google.com).
+    /// Pokud Google zobrazí rozcestník AccountChooser s již přihlášeným účtem (bez pole pro heslo),
+    /// automaticky vybere odpovídající přihlášený účet.
+    /// </summary>
+    private async Task<bool> TrySilentSessionRefreshCoreAsync(string? expectedEmail, CancellationToken ct = default)
+    {
+        try
+        {
+            Logger.Debug("Zkouším tichou obnovu relace Google Photos přes accounts.google.com (ServiceLogin passive=true)...");
+            await NavigateAndWaitForDomAsync(SilentServiceLoginUrl, 12000);
+
+            bool accountTileClicked = false;
+            var normalizedExpected = SyncEngine.NormalizeGoogleEmail(expectedEmail);
+
+            for (int step = 0; step < 10; step++)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(750, ct);
+
+                var url = _webView.CoreWebView2.Source ?? "";
+                if (url.StartsWith(PhotosHomeUrl, StringComparison.OrdinalIgnoreCase) && !IsLoginOrMarketingUrl(url))
+                {
+                    return true;
+                }
+
+                if (IsGoogleAccountAuthRedirectUrl(url))
+                {
+                    var safeExpectedJson = JsonSerializer.Serialize(normalizedExpected);
+                    var chooserScript = $@"
+                        (() => {{
+                            const hasPasswordInput = Array.from(document.querySelectorAll('input[type=""password""]'))
+                                .some(el => el.offsetParent !== null && el.getBoundingClientRect().width > 0);
+                            if (hasPasswordInput) {{
+                                return JSON.stringify({{ state: 'REQUIRES_PASSWORD', email: '' }});
+                            }}
+
+                            const tiles = Array.from(document.querySelectorAll('[data-identifier], [data-email]'))
+                                .filter(el => el.offsetParent !== null && el.getBoundingClientRect().width > 0);
+                            if (tiles.length === 0) {{
+                                const hasEmailInput = Array.from(document.querySelectorAll('input[type=""email""], input[name=""identifier""]'))
+                                    .some(el => el.offsetParent !== null && el.getBoundingClientRect().width > 0);
+                                return JSON.stringify({{ state: hasEmailInput ? 'REQUIRES_IDENTIFIER' : 'REDIRECTING', email: '' }});
+                            }}
+
+                            const list = tiles.map(el => ({{
+                                email: (el.getAttribute('data-identifier') || el.getAttribute('data-email') || '').trim(),
+                                text: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim(),
+                                el: el
+                            }})).filter(x => x.email.includes('@'));
+
+                            return JSON.stringify({{
+                                state: 'ACCOUNT_CHOOSER',
+                                accounts: list.map(x => ({{ email: x.email, text: x.text }}))
+                            }});
+                        }})();
+                    ";
+
+                    var raw = await _webView.CoreWebView2.ExecuteScriptAsync(chooserScript);
+                    var inner = JsonSerializer.Deserialize<string>(raw ?? "\"\"");
+                    if (!string.IsNullOrWhiteSpace(inner))
+                    {
+                        using var doc = JsonDocument.Parse(inner);
+                        var state = doc.RootElement.GetProperty("state").GetString() ?? "";
+                        if (state is "REQUIRES_PASSWORD" or "REQUIRES_IDENTIFIER")
+                        {
+                            Logger.Debug($"Tichá obnova relace vyžaduje ruční přihlášení uživatele ({state}).");
+                            return false;
+                        }
+
+                        if (!accountTileClicked &&
+                            state == "ACCOUNT_CHOOSER" &&
+                            doc.RootElement.TryGetProperty("accounts", out var accountsElem) &&
+                            accountsElem.ValueKind == JsonValueKind.Array)
+                        {
+                            var candidates = new List<(string Email, string Text)>();
+                            foreach (var acc in accountsElem.EnumerateArray())
+                            {
+                                var em = acc.TryGetProperty("email", out var ep) ? ep.GetString() ?? "" : "";
+                                var tx = acc.TryGetProperty("text", out var tp) ? tp.GetString() ?? "" : "";
+                                if (!string.IsNullOrWhiteSpace(em))
+                                {
+                                    candidates.Add((em, tx));
+                                }
+                            }
+
+                            var targetEmail = SelectSignedInAccountFromChooser(candidates, expectedEmail);
+                            if (!string.IsNullOrWhiteSpace(targetEmail))
+                            {
+                                accountTileClicked = true;
+                                var safeTargetJson = JsonSerializer.Serialize(targetEmail);
+                                await _webView.CoreWebView2.ExecuteScriptAsync($@"
+                                    (() => {{
+                                        const target = {safeTargetJson}.toLowerCase();
+                                        const tiles = Array.from(document.querySelectorAll('[data-identifier], [data-email]'));
+                                        for (const el of tiles) {{
+                                            const em = (el.getAttribute('data-identifier') || el.getAttribute('data-email') || '').trim().toLowerCase();
+                                            if (em === target) {{
+                                                const clickable = el.querySelector('[role=""link""], [role=""button""], div[tabindex]') || el;
+                                                clickable.click();
+                                                return true;
+                                            }}
+                                        }}
+                                        return false;
+                                    }})();
+                                ");
+                                Logger.Debug($"V rozcestníku účtů Google automaticky vybrán přihlášený účet '{targetEmail}'.");
+                            }
+                            else
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (url.Contains("/about", StringComparison.OrdinalIgnoreCase) ||
+                    url.Contains("workspace.google.com", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Přesměrováno na marketingovou stránku Google Photos -> hlavní relace na accounts.google.com není aktivní
+                    return false;
+                }
+            }
+
+            var finalUrl = _webView.CoreWebView2.Source ?? "";
+            if (!finalUrl.StartsWith(PhotosHomeUrl, StringComparison.OrdinalIgnoreCase) || IsLoginOrMarketingUrl(finalUrl))
+            {
+                bool navBackOk = await NavigateAndWaitForDomAsync(PhotosHomeUrl, 12000);
+                if (!navBackOk) return false;
+                finalUrl = _webView.CoreWebView2.Source ?? "";
+            }
+
+            return finalUrl.StartsWith(PhotosHomeUrl, StringComparison.OrdinalIgnoreCase) && !IsLoginOrMarketingUrl(finalUrl);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug($"Tichá obnova relace se nezdařila: {ex.Message}");
+            return false;
+        }
+    }
+
+    public static bool IsGoogleAccountAuthRedirectUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return false;
+        return url.StartsWith("https://accounts.google.com", StringComparison.OrdinalIgnoreCase) ||
+               url.StartsWith("https://accounts.youtube.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool ShouldKeepWaitingForAuthRedirect(string? url, int attemptIndex, int maxRedirectWaitAttempts = 4)
+    {
+        if (attemptIndex < 0 || attemptIndex >= maxRedirectWaitAttempts)
+            return false;
+
+        return IsGoogleAccountAuthRedirectUrl(url);
+    }
+
+    public static bool IsSignedOutAccountTileText(string? tileText)
+    {
+        if (string.IsNullOrWhiteSpace(tileText))
+            return false;
+
+        return Regex.IsMatch(
+            tileText,
+            @"\b(Odhlášeno|Odhlášen|Signed\s+out|Session\s+expired|Relace\s+vypršela|Ověřte\s+svou\s+totožnost|Verify\s+it's\s+you|Verify\s+it\u2019s\s+you)\b",
+            RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// Čistá testovatelná logika výběru přihlášeného účtu v Google AccountChooseru:
+    /// - Nikdy nevybere účet označený jako „Odhlášeno“ / „Signed out“.
+    /// - Pokud je zadán expectedEmail, vybere výhradně účet, který mu po normalizaci odpovídá.
+    /// - Pokud expectedEmail není zadán, vybere účet pouze tehdy, když je v seznamu právě jeden přihlášený účet.
+    /// </summary>
+    public static string? SelectSignedInAccountFromChooser(
+        IReadOnlyList<(string Email, string TileText)> candidates,
+        string? expectedEmail)
+    {
+        if (candidates == null || candidates.Count == 0)
+            return null;
+
+        var signedIn = candidates
+            .Where(c => !string.IsNullOrWhiteSpace(c.Email) && !IsSignedOutAccountTileText(c.TileText))
+            .ToList();
+
+        if (signedIn.Count == 0)
+            return null;
+
+        var normExpected = SyncEngine.NormalizeGoogleEmail(expectedEmail);
+        if (!string.IsNullOrWhiteSpace(normExpected))
+        {
+            var match = signedIn.FirstOrDefault(c =>
+                string.Equals(SyncEngine.NormalizeGoogleEmail(c.Email), normExpected, StringComparison.Ordinal));
+            return string.IsNullOrWhiteSpace(match.Email) ? null : match.Email;
+        }
+
+        return signedIn.Count == 1 ? signedIn[0].Email : null;
+    }
+
+    public static bool IsLoginOrMarketingUrl(string? url)
     {
         if (string.IsNullOrWhiteSpace(url)) return true;
         return url.Contains("accounts.google.com", StringComparison.OrdinalIgnoreCase) ||
@@ -619,6 +942,15 @@ public class GooglePhotosEngine : IDisposable
             }
 
             var currentUrl = _webView.CoreWebView2.Source ?? "";
+            if (IsLoginOrMarketingUrl(currentUrl))
+            {
+                if (await TrySilentSessionRefreshCoreAsync(_lastVerifiedEmail, ct))
+                {
+                    await NavigateAndWaitForDomAsync(recentlyAddedUrl, 15000);
+                    currentUrl = _webView.CoreWebView2.Source ?? "";
+                }
+            }
+
             if (IsLoginOrMarketingUrl(currentUrl) ||
                 !currentUrl.Contains("/search/", StringComparison.OrdinalIgnoreCase))
             {
@@ -771,6 +1103,15 @@ public class GooglePhotosEngine : IDisposable
             }
 
             var currentUrl = _webView.CoreWebView2.Source ?? "";
+            if (IsLoginOrMarketingUrl(currentUrl))
+            {
+                if (await TrySilentSessionRefreshCoreAsync(_lastVerifiedEmail, ct))
+                {
+                    await NavigateAndWaitForDomAsync(PhotosHomeUrl, 18000);
+                    currentUrl = _webView.CoreWebView2.Source ?? "";
+                }
+            }
+
             if (IsLoginOrMarketingUrl(currentUrl))
             {
                 _isKnownLoggedIn = false;
@@ -1346,6 +1687,16 @@ public class GooglePhotosEngine : IDisposable
                 await Task.Delay(1500, ct);
 
                 var currentUrl = _webView.CoreWebView2.Source ?? "";
+                if (IsLoginOrMarketingUrl(currentUrl))
+                {
+                    if (await TrySilentSessionRefreshCoreAsync(_lastVerifiedEmail, ct))
+                    {
+                        await NavigateAndWaitForDomAsync(item.PhotoUrl, 15000);
+                        await Task.Delay(1500, ct);
+                        currentUrl = _webView.CoreWebView2.Source ?? "";
+                    }
+                }
+
                 if (!IsExactPhotoDetailUrl(currentUrl, item.MediaKey))
                 {
                     return new DownloadResult
@@ -1529,6 +1880,16 @@ public class GooglePhotosEngine : IDisposable
             await Task.Delay(1500, ct);
 
             var currentUrl = _webView.CoreWebView2.Source ?? "";
+            if (IsLoginOrMarketingUrl(currentUrl))
+            {
+                if (await TrySilentSessionRefreshCoreAsync(_lastVerifiedEmail, ct))
+                {
+                    await NavigateAndWaitForDomAsync(targetUrl, 15000);
+                    await Task.Delay(1500, ct);
+                    currentUrl = _webView.CoreWebView2.Source ?? "";
+                }
+            }
+
             if (IsLoginOrMarketingUrl(currentUrl))
             {
                 _isKnownLoggedIn = false;

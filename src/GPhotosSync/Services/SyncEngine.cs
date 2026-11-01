@@ -451,11 +451,12 @@ public class SyncEngine : IDisposable
                 Logger.Warn($"Mazání neprovedeno – účet Google není přihlášen nebo nesouhlasí: {loginCheck.ErrorMessage}");
                 bool isMismatch = !string.IsNullOrWhiteSpace(_config.ExpectedGoogleAccountEmail) &&
                                   !string.IsNullOrWhiteSpace(loginCheck.DetectedEmail);
+                bool isNavError = loginCheck.IsNavigationError;
                 RaiseStatus(
                     loginCheck.ErrorMessage ?? "Vyžadováno přihlášení k účtu Google",
                     isSyncing: false,
-                    requiresLogin: !isMismatch,
-                    hasError: isMismatch);
+                    requiresLogin: !isMismatch && !isNavError,
+                    hasError: isMismatch || isNavError);
                 return;
             }
 
@@ -1119,16 +1120,17 @@ public class SyncEngine : IDisposable
                 Logger.Warn($"Synchronizace neprovedena: {loginRes.ErrorMessage}");
                 bool isAccountMismatch = !string.IsNullOrWhiteSpace(_config.ExpectedGoogleAccountEmail) &&
                                          !string.IsNullOrWhiteSpace(loginRes.DetectedEmail);
+                bool isNavError = loginRes.IsNavigationError;
                 RaiseStatus(
                     loginRes.ErrorMessage ?? "Vyžadováno přihlášení k účtu Google",
                     isSyncing: false,
-                    requiresLogin: !isAccountMismatch,
-                    hasError: isAccountMismatch);
+                    requiresLogin: !isAccountMismatch && !isNavError,
+                    hasError: isAccountMismatch || isNavError);
 
                 if (manualTrigger)
                 {
                     ShowNotification?.Invoke(
-                        isAccountMismatch ? "Nesouhlasí účet Google" : "Vyžadováno přihlášení",
+                        isAccountMismatch ? "Nesouhlasí účet Google" : (isNavError ? "Nelze načíst Google Photos" : "Vyžadováno přihlášení"),
                         loginRes.ErrorMessage ?? "Klikněte na ikonu aplikace u hodin a přihlaste se ke Google Photos.",
                         ToolTipIcon.Warning);
                 }

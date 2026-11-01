@@ -1167,4 +1167,69 @@ public class AuditLogicTests : IDisposable
     {
         Assert.Equal(expected, GPhotosSync.Forms.SettingsForm.FoldersAreNested(a, b));
     }
+
+    // -------------------------------------------------------------------------
+    // Trvalé přihlášení a tichá obnova relace Google Photos (OSID -> SID)
+    // -------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("https://accounts.google.com/ServiceLogin?service=lh2&passive=true", 0, true)]
+    [InlineData("https://accounts.google.com/v3/signin/identifier", 3, true)]
+    [InlineData("https://accounts.google.com/v3/signin/identifier", 4, false)]
+    [InlineData("https://photos.google.com/about/", 0, false)]
+    [InlineData("https://photos.google.com/", 0, false)]
+    public void ShouldKeepWaitingForAuthRedirect_WaitsOnAccountsGoogleComUntilMaxAttempts(string url, int attempt, bool expected)
+    {
+        Assert.Equal(expected, GooglePhotosEngine.ShouldKeepWaitingForAuthRedirect(url, attempt, maxRedirectWaitAttempts: 4));
+    }
+
+    [Theory]
+    [InlineData("Jan Novák\njan.novak@gmail.com\nOdhlášeno", true)]
+    [InlineData("Jan Novak\njan.novak@gmail.com\nSigned out", true)]
+    [InlineData("Relace vypršela – jan.novak@gmail.com", true)]
+    [InlineData("Verify it's you – jan.novak@gmail.com", true)]
+    [InlineData("Jan Novák\njan.novak@gmail.com", false)]
+    public void IsSignedOutAccountTileText_DetectsSignedOutOrExpiredTiles(string tileText, bool expected)
+    {
+        Assert.Equal(expected, GooglePhotosEngine.IsSignedOutAccountTileText(tileText));
+    }
+
+    [Fact]
+    public void SelectSignedInAccountFromChooser_PicksOnlySignedInMatchingExpectedEmail()
+    {
+        var candidates = new List<(string Email, string TileText)>
+        {
+            ("druhy@gmail.com", "Druhý Účet\ndruhy@gmail.com"),
+            ("jan.novak@gmail.com", "Jan Novák\njan.novak@gmail.com")
+        };
+
+        // Shoda i přes tečky a @googlemail.com variantu
+        var picked = GooglePhotosEngine.SelectSignedInAccountFromChooser(candidates, "JanNovak@googlemail.com");
+        Assert.Equal("jan.novak@gmail.com", picked);
+
+        // Pokud očekávaný účet v seznamu není, nikdy nevybere cizí účet
+        Assert.Null(GooglePhotosEngine.SelectSignedInAccountFromChooser(candidates, "treti@gmail.com"));
+
+        // Pokud není zadán očekávaný účet a v seznamu je více účtů, nevybere žádný
+        Assert.Null(GooglePhotosEngine.SelectSignedInAccountFromChooser(candidates, expectedEmail: null));
+    }
+
+    [Fact]
+    public void SelectSignedInAccountFromChooser_NeverSelectsSignedOutAccount()
+    {
+        var signedOutCandidates = new List<(string Email, string TileText)>
+        {
+            ("jan.novak@gmail.com", "Jan Novák\njan.novak@gmail.com\nOdhlášeno")
+        };
+
+        Assert.Null(GooglePhotosEngine.SelectSignedInAccountFromChooser(signedOutCandidates, "jan.novak@gmail.com"));
+        Assert.Null(GooglePhotosEngine.SelectSignedInAccountFromChooser(signedOutCandidates, expectedEmail: null));
+
+        var singleSignedIn = new List<(string Email, string TileText)>
+        {
+            ("jan.novak@gmail.com", "Jan Novák\njan.novak@gmail.com")
+        };
+
+        Assert.Equal("jan.novak@gmail.com", GooglePhotosEngine.SelectSignedInAccountFromChooser(singleSignedIn, expectedEmail: null));
+    }
 }

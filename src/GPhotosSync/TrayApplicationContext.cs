@@ -202,6 +202,9 @@ public class TrayApplicationContext : ApplicationContext
         // Ensure Windows startup matches config
         StartupManager.SetStartWithWindows(_config.StartWithWindows);
 
+        // Čisté ukončení WebView2 při vypínání nebo odhlašování Windows, aby se bezpečně zapsaly zrotované cookies na disk
+        Microsoft.Win32.SystemEvents.SessionEnding += OnWindowsSessionEnding;
+
         // Kick off initial startup flow asynchronously on UI thread
         var initTimer = new System.Windows.Forms.Timer { Interval = 400 };
         initTimer.Tick += async (_, _) =>
@@ -430,8 +433,19 @@ public class TrayApplicationContext : ApplicationContext
         _openSettingsForm.Show();
     }
 
+    private bool _isExiting;
+
+    private void OnWindowsSessionEnding(object? sender, Microsoft.Win32.SessionEndingEventArgs e)
+    {
+        ExitApplication();
+    }
+
     private void ExitApplication()
     {
+        if (_isExiting) return;
+        _isExiting = true;
+
+        Microsoft.Win32.SystemEvents.SessionEnding -= OnWindowsSessionEnding;
         _updateCheckTimer.Stop();
         _updateCheckTimer.Dispose();
         _syncEngine.CancelCurrentSync();
