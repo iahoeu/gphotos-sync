@@ -244,6 +244,9 @@ public class GooglePhotosEngine : IDisposable
     private string? _lastVerifiedEmail;
     private string? _manuallyConfirmedSessionEmail;
     private DateTime _lastSilentKeepAliveUtc = DateTime.MinValue;
+    private string _lastSilentRefreshFailure = "";
+    private bool _loginCookiesLogged;
+    private bool _logoutDiagnosticsLogged;
 
     public string? LastVerifiedEmail => _lastVerifiedEmail;
 
@@ -458,6 +461,7 @@ public class GooglePhotosEngine : IDisposable
                 {
                     _lastSilentKeepAliveUtc = DateTime.UtcNow;
                 }
+                if (initialProbe.IsLoggedIn) await LogLoginCookiesOnceAsync();
                 return initialProbe.Result;
             }
 
@@ -474,9 +478,20 @@ public class GooglePhotosEngine : IDisposable
                         _lastSilentKeepAliveUtc = DateTime.UtcNow;
                         afterRefreshProbe.Result.WasSilentlyRefreshed = true;
                         Logger.Info("Přihlašovací relace Google Photos byla automaticky tiše obnovena přes účet Google.");
+                        await LogLoginCookiesOnceAsync();
                     }
                     return afterRefreshProbe.Result;
                 }
+            }
+
+            if (!_logoutDiagnosticsLogged)
+            {
+                _logoutDiagnosticsLogged = true;
+                _loginCookiesLogged = false;
+                var reason = refreshed
+                    ? "tichá obnova doběhla, ale stránka Google Photos se stále hlásí jako nepřihlášená"
+                    : _lastSilentRefreshFailure;
+                Logger.Warn($"Diagnostika odhlášení: tichá obnova relace neuspěla ({reason}); URL: {StripUrlQuery(_webView.CoreWebView2.Source)}; cookies: {await GetAuthCookieSummaryAsync()}");
             }
 
             _isKnownLoggedIn = false;
@@ -504,6 +519,60 @@ public class GooglePhotosEngine : IDisposable
         {
             _operationLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Jednou po každém (znovu)přihlášení zapíše do protokolu platnost přihlašovacích cookies Google,
+    /// aby šlo dohledat, která z nich stojí za pravidelným odhlášením.
+    /// </summary>
+    private async Task LogLoginCookiesOnceAsync()
+    {
+        _logoutDiagnosticsLogged = false;
+        if (_loginCookiesLogged) return;
+        _loginCookiesLogged = true;
+        Logger.Info($"Přihlášení ke Google Photos ověřeno; platnost cookies: {await GetAuthCookieSummaryAsync()}");
+    }
+
+    private async Task<string> GetAuthCookieSummaryAsync()
+    {
+        try
+        {
+            var all = new List<(string Name, string Domain, DateTime Expires, bool IsSession)>();
+            foreach (var uri in new[] { "https://accounts.google.com/", PhotosHomeUrl })
+            {
+                foreach (var c in await _webView.CoreWebView2.CookieManager.GetCookiesAsync(uri))
+                {
+                    all.Add((c.Name, c.Domain, c.Expires, c.IsSession));
+                }
+            }
+            return FormatCookieExpirySummary(all);
+        }
+        catch (Exception ex)
+        {
+            return $"nelze načíst ({ex.Message})";
+        }
+    }
+
+    /// <summary>
+    /// Přehled cookies (jen název, doména a konec platnosti, nikdy hodnota), seřazený od nejdříve končící.
+    /// </summary>
+    public static string FormatCookieExpirySummary(IEnumerable<(string Name, string Domain, DateTime Expires, bool IsSession)> cookies)
+    {
+        var parts = cookies
+            .GroupBy(c => (c.Name, c.Domain))
+            .Select(g => g.First())
+            .OrderBy(c => c.IsSession ? DateTime.MinValue : c.Expires)
+            .ThenBy(c => c.Name, StringComparer.Ordinal)
+            .Select(c => $"{c.Name}@{c.Domain}={(c.IsSession ? "relace" : c.Expires.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture))}")
+            .ToList();
+        return parts.Count == 0 ? "žádné" : string.Join(", ", parts);
+    }
+
+    public static string StripUrlQuery(string? url)
+    {
+        if (string.IsNullOrEmpty(url)) return "";
+        int i = url.IndexOfAny(new[] { '?', '#' });
+        return i < 0 ? url : url[..i];
     }
 
     private async Task<(bool IsLoggedIn, bool IsAccountMismatch, AccountCheckResult Result)> ProbePhotosLoginWithWaitAsync(
@@ -766,6 +835,7 @@ public class GooglePhotosEngine : IDisposable
                         if (state is "REQUIRES_PASSWORD" or "REQUIRES_IDENTIFIER")
                         {
                             Logger.Debug($"Tichá obnova relace vyžaduje ruční přihlášení uživatele ({state}).");
+                            _lastSilentRefreshFailure = $"Google vyžaduje ruční přihlášení ({state})";
                             return false;
                         }
 
@@ -809,6 +879,7 @@ public class GooglePhotosEngine : IDisposable
                             }
                             else
                             {
+                                _lastSilentRefreshFailure = $"v rozcestníku účtů Google není použitelný přihlášený účet ({string.Join("; ", candidates.Select(c => c.Text))})";
                                 return false;
                             }
                         }
@@ -820,6 +891,7 @@ public class GooglePhotosEngine : IDisposable
                     url.Contains("workspace.google.com", StringComparison.OrdinalIgnoreCase))
                 {
                     // Přesměrováno na marketingovou stránku Google Photos -> hlavní relace na accounts.google.com není aktivní
+                    _lastSilentRefreshFailure = "Google přesměroval na úvodní stránku pro nepřihlášené (hlavní relace účtu Google není aktivní)";
                     return false;
                 }
             }
@@ -828,10 +900,15 @@ public class GooglePhotosEngine : IDisposable
             if (!finalUrl.StartsWith(PhotosHomeUrl, StringComparison.OrdinalIgnoreCase) || IsLoginOrMarketingUrl(finalUrl))
             {
                 bool navBackOk = await NavigateAndWaitForDomAsync(PhotosHomeUrl, 12000);
-                if (!navBackOk) return false;
+                if (!navBackOk)
+                {
+                    _lastSilentRefreshFailure = "návrat na Google Photos selhal (navigace)";
+                    return false;
+                }
                 finalUrl = _webView.CoreWebView2.Source ?? "";
             }
 
+            _lastSilentRefreshFailure = $"přesměrování skončilo na {StripUrlQuery(finalUrl)}";
             return finalUrl.StartsWith(PhotosHomeUrl, StringComparison.OrdinalIgnoreCase) && !IsLoginOrMarketingUrl(finalUrl);
         }
         catch (OperationCanceledException)
@@ -841,6 +918,7 @@ public class GooglePhotosEngine : IDisposable
         catch (Exception ex)
         {
             Logger.Debug($"Tichá obnova relace se nezdařila: {ex.Message}");
+            _lastSilentRefreshFailure = $"chyba: {ex.Message}";
             return false;
         }
     }

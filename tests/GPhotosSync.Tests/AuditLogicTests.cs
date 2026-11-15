@@ -1232,4 +1232,30 @@ public class AuditLogicTests : IDisposable
 
         Assert.Equal("jan.novak@gmail.com", GooglePhotosEngine.SelectSignedInAccountFromChooser(singleSignedIn, expectedEmail: null));
     }
+
+    [Fact]
+    public void FormatCookieExpirySummary_SortsBySoonestExpiryAndDeduplicates()
+    {
+        var cookies = new List<(string Name, string Domain, DateTime Expires, bool IsSession)>
+        {
+            ("SID", ".google.com", new DateTime(2027, 11, 1, 10, 0, 0), false),
+            ("OSID", "photos.google.com", new DateTime(2026, 11, 8, 10, 53, 0), false),
+            ("SID", ".google.com", new DateTime(2027, 11, 1, 10, 0, 0), false),
+            ("TMP", "accounts.google.com", default, true)
+        };
+
+        Assert.Equal(
+            "TMP@accounts.google.com=relace, OSID@photos.google.com=2026-11-08 10:53, SID@.google.com=2027-11-01 10:00",
+            GooglePhotosEngine.FormatCookieExpirySummary(cookies));
+        Assert.Equal("žádné", GooglePhotosEngine.FormatCookieExpirySummary(Array.Empty<(string, string, DateTime, bool)>()));
+    }
+
+    [Theory]
+    [InlineData("https://accounts.google.com/v3/signin/identifier?Email=a%40b.cz&x=1", "https://accounts.google.com/v3/signin/identifier")]
+    [InlineData("https://photos.google.com/about#x", "https://photos.google.com/about")]
+    [InlineData(null, "")]
+    public void StripUrlQuery_RemovesQueryAndFragment(string? url, string expected)
+    {
+        Assert.Equal(expected, GooglePhotosEngine.StripUrlQuery(url));
+    }
 }
