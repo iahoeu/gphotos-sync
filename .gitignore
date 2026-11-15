@@ -5,6 +5,7 @@ artifacts/
 src/GPhotosSync.Installer/payload.zip
 GPhotosSync_Setup.exe
 _migrace_chatu/
+.gitea_token
 publish_release.ps1
 
 # IDE & OS files
