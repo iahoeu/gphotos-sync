@@ -37,12 +37,12 @@ public class UpdateService
         return Assembly.GetExecutingAssembly().GetName().Version ?? new Version(1, 0, 0);
     }
 
-    private const string RepoOwner = "iahoeu";
-    private const string RepoName = "gphotos-sync";
-    private const string LatestReleaseApiUrl = "https://api.github.com/repos/" + RepoOwner + "/" + RepoName + "/releases/latest";
-    private const string ReleaseDownloadPrefix = "https://github.com/" + RepoOwner + "/" + RepoName + "/releases/download/";
+    public bool IsConfigured =>
+        !string.IsNullOrWhiteSpace(_config.GiteaServerUrl) &&
+        !string.IsNullOrWhiteSpace(_config.GiteaRepoOwner) &&
+        !string.IsNullOrWhiteSpace(_config.GiteaRepoName);
 
-    private static readonly string[] AllowedHosts =
+    private static readonly string[] GitHubHosts =
     {
         "api.github.com",
         "github.com",
@@ -51,32 +51,65 @@ public class UpdateService
     };
 
     /// <summary>
-    /// Ověří, že URL pro aktualizaci používá výhradně HTTPS (port 443) a směřuje na doménu GitHubu (P2-13).
+    /// Vrátí true, pokud nakonfigurovaný server je GitHub (github.com / www.github.com).
     /// </summary>
-    public static bool IsAllowedUpdateUrl(string? candidateUrl)
+    public static bool IsGitHubServer(string? serverUrl)
     {
-        if (string.IsNullOrWhiteSpace(candidateUrl))
+        return Uri.TryCreate(serverUrl?.Trim(), UriKind.Absolute, out var uri) &&
+               (string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(uri.Host, "www.github.com", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string BuildLatestReleaseApiUrl(string serverUrl, string owner, string repo)
+    {
+        return IsGitHubServer(serverUrl)
+            ? $"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+            : $"{serverUrl.Trim().TrimEnd('/')}/api/v1/repos/{owner}/{repo}/releases/latest";
+    }
+
+    /// <summary>
+    /// Ověří, že URL pro aktualizaci používá výhradně protokol HTTPS a směřuje na nakonfigurovaný server;
+    /// u GitHubu na jeho povolené domény (P2-13).
+    /// </summary>
+    public static bool IsAllowedUpdateUrl(string? candidateUrl, string? configuredGiteaServerUrl)
+    {
+        if (string.IsNullOrWhiteSpace(candidateUrl) || string.IsNullOrWhiteSpace(configuredGiteaServerUrl))
             return false;
 
-        if (!Uri.TryCreate(candidateUrl.Trim(), UriKind.Absolute, out var uri) ||
-            !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
-            uri.Port != 443)
+        if (!Uri.TryCreate(configuredGiteaServerUrl.Trim(), UriKind.Absolute, out var baseUri) ||
+            !string.Equals(baseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        return AllowedHosts.Contains(uri.Host, StringComparer.OrdinalIgnoreCase);
+        if (!Uri.TryCreate(candidateUrl.Trim(), UriKind.Absolute, out var candidateUri) ||
+            !string.Equals(candidateUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (IsGitHubServer(configuredGiteaServerUrl))
+        {
+            return candidateUri.Port == 443 &&
+                   GitHubHosts.Contains(candidateUri.Host, StringComparer.OrdinalIgnoreCase);
+        }
+
+        return string.Equals(candidateUri.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase) &&
+               candidateUri.Port == baseUri.Port;
     }
 
     /// <summary>
-    /// Vybere URL instalátoru z pole assets v GitHub release odpovědi a ověří, že splňuje bezpečnostní pravidla (P2-13).
+    /// Vybere URL instalátoru z pole assets v release odpovědi a ověří, že splňuje bezpečnostní pravidla (P2-13).
     /// </summary>
-    public static string SelectInstallerAssetUrl(JsonElement assetsArray)
+    public static string SelectInstallerAssetUrl(JsonElement assetsArray, string? configuredGiteaServerUrl, string? owner = null, string? repo = null)
     {
         if (assetsArray.ValueKind != JsonValueKind.Array)
             return string.Empty;
 
         string fallbackExeUrl = string.Empty;
+        var githubPrefix = IsGitHubServer(configuredGiteaServerUrl)
+            ? $"https://github.com/{owner?.Trim()}/{repo?.Trim()}/releases/download/"
+            : null;
 
         foreach (var asset in assetsArray.EnumerateArray())
         {
@@ -86,8 +119,10 @@ public class UpdateService
             if (!name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(url))
                 continue;
 
-            if (!IsAllowedUpdateUrl(url) ||
-                !url.Trim().StartsWith(ReleaseDownloadPrefix, StringComparison.OrdinalIgnoreCase))
+            if (!IsAllowedUpdateUrl(url, configuredGiteaServerUrl))
+                continue;
+
+            if (githubPrefix != null && !url.Trim().StartsWith(githubPrefix, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             if (name.Contains("Setup", StringComparison.OrdinalIgnoreCase))
@@ -112,10 +147,10 @@ public class UpdateService
 
         for (int i = 0; i <= maxRedirects; i++)
         {
-            if (!IsAllowedUpdateUrl(currentUrl))
+            if (!IsAllowedUpdateUrl(currentUrl, _config.GiteaServerUrl))
             {
                 throw new InvalidOperationException(
-                    $"Nepovolená URL pro aktualizaci: '{currentUrl}'. Povoleno je pouze HTTPS na doménách GitHubu.");
+                    $"Nepovolená URL pro aktualizaci: '{currentUrl}'. Povoleno je pouze HTTPS na nakonfigurovaném serveru aktualizací.");
             }
 
             using var req = new HttpRequestMessage(HttpMethod.Get, currentUrl);
@@ -123,14 +158,18 @@ public class UpdateService
             {
                 req.Headers.UserAgent.Add(new ProductInfoHeaderValue("GPhotosSync", userAgentVersion));
             }
-            if (isApiCall)
+
+            if (IsGitHubServer(_config.GiteaServerUrl))
             {
-                req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
-                req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
-            }
-            else
-            {
-                req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
+                if (isApiCall)
+                {
+                    req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+                    req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
+                }
+                else
+                {
+                    req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
+                }
             }
 
             var resp = await Http.SendAsync(req, completionOption, ct);
@@ -148,7 +187,7 @@ public class UpdateService
             return resp;
         }
 
-        throw new InvalidOperationException("Příliš mnoho přesměrování při komunikaci s GitHubem.");
+        throw new InvalidOperationException("Příliš mnoho přesměrování při komunikaci se serverem aktualizací.");
     }
 
     public async Task<UpdateCheckResult> CheckForUpdatesAsync(CancellationToken ct = default)
@@ -156,20 +195,46 @@ public class UpdateService
         var currentVer = GetCurrentVersion();
         var currentVerStr = $"{currentVer.Major}.{currentVer.Minor}.{Math.Max(0, currentVer.Build)}";
 
+        if (!IsConfigured)
+        {
+            return new UpdateCheckResult
+            {
+                IsUpdateAvailable = false,
+                CurrentVersion = currentVerStr,
+                ErrorMessage = "Server aktualizací zatím není vyplněn v Nastavení."
+            };
+        }
+
         try
         {
-            using var resp = await SendWithSafeRedirectAsync(LatestReleaseApiUrl, currentVerStr, true, HttpCompletionOption.ResponseContentRead, ct);
+            var baseUrl = _config.GiteaServerUrl.Trim().TrimEnd('/');
+            if (!IsAllowedUpdateUrl(baseUrl, _config.GiteaServerUrl))
+            {
+                return new UpdateCheckResult
+                {
+                    IsUpdateAvailable = false,
+                    CurrentVersion = currentVerStr,
+                    ErrorMessage = "URL serveru aktualizací musí začínat na https://."
+                };
+            }
+
+            var owner = _config.GiteaRepoOwner.Trim();
+            var repo = _config.GiteaRepoName.Trim();
+
+            var apiUrl = BuildLatestReleaseApiUrl(baseUrl, owner, repo);
+
+            using var resp = await SendWithSafeRedirectAsync(apiUrl, currentVerStr, true, HttpCompletionOption.ResponseContentRead, ct);
             if (!resp.IsSuccessStatusCode)
             {
                 var status = (int)resp.StatusCode;
-                var hint = status is 403 or 429
+                var hint = IsGitHubServer(baseUrl) && status is 403 or 429
                     ? " Limit požadavků GitHubu byl pravděpodobně překročen, kontrola se zopakuje později."
                     : "";
                 return new UpdateCheckResult
                 {
                     IsUpdateAvailable = false,
                     CurrentVersion = currentVerStr,
-                    ErrorMessage = $"GitHub API vrátilo stav {status} ({resp.ReasonPhrase}).{hint}"
+                    ErrorMessage = $"Server aktualizací vrátil stav {status} ({resp.ReasonPhrase}).{hint}"
                 };
             }
 
@@ -194,7 +259,7 @@ public class UpdateService
             string downloadUrl = "";
             if (root.TryGetProperty("assets", out var assetsProp) && assetsProp.ValueKind == JsonValueKind.Array)
             {
-                downloadUrl = SelectInstallerAssetUrl(assetsProp);
+                downloadUrl = SelectInstallerAssetUrl(assetsProp, _config.GiteaServerUrl, owner, repo);
             }
 
             bool isNewer = latestVer > new Version(currentVer.Major, currentVer.Minor, Math.Max(0, currentVer.Build));
@@ -206,7 +271,7 @@ public class UpdateService
                     IsUpdateAvailable = false,
                     CurrentVersion = currentVerStr,
                     LatestVersion = $"{latestVer.Major}.{latestVer.Minor}.{Math.Max(0, latestVer.Build)}",
-                    ErrorMessage = "Byla nalezena nová verze, ale neobsahuje platný instalátor na povolené HTTPS doméně GitHubu."
+                    ErrorMessage = "Byla nalezena nová verze, ale neobsahuje platný instalátor na povolené HTTPS doméně serveru aktualizací."
                 };
             }
 
@@ -221,7 +286,7 @@ public class UpdateService
         }
         catch (Exception ex)
         {
-            Logger.Warn($"Kontrola aktualizací na GitHubu selhala: {ex.Message}");
+            Logger.Warn($"Kontrola aktualizací na serveru aktualizací selhala: {ex.Message}");
             return new UpdateCheckResult
             {
                 IsUpdateAvailable = false,
@@ -235,13 +300,13 @@ public class UpdateService
     {
         try
         {
-            if (!IsAllowedUpdateUrl(downloadUrl))
+            if (!IsAllowedUpdateUrl(downloadUrl, _config.GiteaServerUrl))
             {
-                Logger.Error($"Aktualizace zablokována: URL '{downloadUrl}' není na povolené HTTPS doméně GitHubu.");
+                Logger.Error($"Aktualizace zablokována: URL '{downloadUrl}' není na povoleném HTTPS serveru aktualizací.");
                 return false;
             }
 
-            Logger.Info($"Stahuji novou verzi instalátoru z GitHubu: {downloadUrl}");
+            Logger.Info($"Stahuji novou verzi instalátoru ze serveru aktualizací: {downloadUrl}");
 
             var currentVer = GetCurrentVersion();
             var currentVerStr = $"{currentVer.Major}.{currentVer.Minor}.{Math.Max(0, currentVer.Build)}";

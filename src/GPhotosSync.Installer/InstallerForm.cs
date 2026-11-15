@@ -553,7 +553,10 @@ public class InstallerForm : Form
                 DownloadFolder = photosDir,
                 TwoWayDelete = _chkTwoWayDelete.Checked,
                 DownloadVideos = _chkVideos.Checked,
-                InitialMode = initialModeStr
+                InitialMode = initialModeStr,
+                GiteaServerUrl = "https://github.com",
+                GiteaRepoOwner = "iahoeu",
+                GiteaRepoName = "gphotos-sync"
             };
             File.WriteAllText(
                 Path.Combine(appDataDir, "installer_defaults.json"),

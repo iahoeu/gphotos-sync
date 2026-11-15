@@ -26,8 +26,9 @@ Stáhněte nejnovější instalátor `GPhotosSync_Setup.exe` z <https://github.c
    - Stáhnout celou historii
    - Výchozí stav režimu „jen nové“ se zaznamenává postupně přes více cyklů; fotky ze dne instalace a novější se mezitím stahují.
    - **Omezení hloubky:** časová osa se prochází posouváním webu od začátku. U velmi velké knihovny nemusí kontrola dosáhnout nejstarší historie (výchozí stav, „celá historie“, týdenní úplná kontrola). Aplikace to pak hlásí u ikony v liště a v protokolu jako „Neúplná kontrola knihovny“.
-6. **Automatická kontrola a tichá instalace aktualizací z GitHubu:**
-   - Aplikace kontroluje nejnovější vydání přes `https://api.github.com/repos/iahoeu/gphotos-sync/releases/latest` a umí instalátor sama stáhnout a provést tichou aktualizaci (`--silent-update`).
+6. **Automatická kontrola a tichá instalace aktualizací:**
+   - Ve výchozím stavu aplikace kontroluje nejnovější vydání na GitHubu přes `https://api.github.com/repos/iahoeu/gphotos-sync/releases/latest` a umí instalátor sama stáhnout a provést tichou aktualizaci (`--silent-update`).
+   - V Nastavení lze aktualizace přesměrovat na vlastní server Gitea/Forgejo (Server URL + vlastník/repozitář). Aplikace pak používá `/api/v1/repos/{vlastník}/{repozitář}/releases/latest` na zadaném serveru.
 
 ## Licence
 Projekt je šířen pod licencí MIT, viz [LICENSE](LICENSE).
