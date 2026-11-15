@@ -18,11 +18,7 @@ public class SettingsForm : Form
     private readonly CheckBox _chkStartWithWindows;
     private readonly CheckBox _chkNotifications;
 
-    // Gitea Auto-Update controls
-    private readonly TextBox _txtGiteaUrl;
-    private readonly TextBox _txtGiteaOwner;
-    private readonly TextBox _txtGiteaRepo;
-    private readonly TextBox _txtGiteaToken;
+    // Auto-Update controls
     private readonly CheckBox _chkAutoCheckUpdates;
     private readonly CheckBox _chkAutoInstallUpdates;
 
@@ -206,49 +202,19 @@ public class SettingsForm : Form
         grpSync.Controls.Add(_chkStartWithWindows);
         grpSync.Controls.Add(_chkNotifications);
 
-        // Gitea Auto-Update Section
-        var grpGitea = new GroupBox
+        // GitHub Auto-Update Section
+        var grpUpdates = new GroupBox
         {
-            Text = "Automatické aktualizace z vlastního Gitea serveru (Reverse Proxy / LAN)",
+            Text = "Automatické aktualizace z GitHubu",
             Location = new Point(18, 284),
             Size = new Size(628, 152)
         };
 
-        var lblGiteaUrl = new Label { Text = "Gitea URL:", Location = new Point(14, 28), AutoSize = true };
-        _txtGiteaUrl = new TextBox
+        var lblSource = new Label
         {
-            Text = _config.GiteaServerUrl,
-            PlaceholderText = "https://git.mojedomena.cz",
-            Location = new Point(95, 25),
-            Size = new Size(235, 26)
-        };
-
-        var lblOwner = new Label { Text = "Vlastník/Repo:", Location = new Point(340, 28), AutoSize = true };
-        _txtGiteaOwner = new TextBox
-        {
-            Text = _config.GiteaRepoOwner,
-            PlaceholderText = "uzivatel",
-            Location = new Point(435, 25),
-            Size = new Size(80, 26)
-        };
-
-        var lblSlash = new Label { Text = "/", Location = new Point(518, 28), AutoSize = true };
-        _txtGiteaRepo = new TextBox
-        {
-            Text = _config.GiteaRepoName,
-            PlaceholderText = "gphotos-sync",
-            Location = new Point(530, 25),
-            Size = new Size(84, 26)
-        };
-
-        var lblToken = new Label { Text = "API Token (jen pro privátní repo):", Location = new Point(14, 62), AutoSize = true };
-        _txtGiteaToken = new TextBox
-        {
-            Text = _config.GiteaAccessToken,
-            PlaceholderText = "nepovinné (pro veřejný repozitář nechte prázdné)",
-            UseSystemPasswordChar = true,
-            Location = new Point(225, 59),
-            Size = new Size(220, 26)
+            Text = "Zdroj: github.com/iahoeu/gphotos-sync",
+            Location = new Point(14, 28),
+            AutoSize = true
         };
 
         var btnCheckUpdate = new Button
@@ -261,7 +227,7 @@ public class SettingsForm : Form
 
         _chkAutoCheckUpdates = new CheckBox
         {
-            Text = "Automaticky kontrolovat nové verze na Gitea serveru (při startu a každých 6 hodin)",
+            Text = "Automaticky kontrolovat nové verze na GitHubu (při startu a každých 6 hodin)",
             Checked = _config.AutoCheckUpdates,
             Location = new Point(14, 94),
             AutoSize = true
@@ -275,17 +241,10 @@ public class SettingsForm : Form
             AutoSize = true
         };
 
-        grpGitea.Controls.Add(lblGiteaUrl);
-        grpGitea.Controls.Add(_txtGiteaUrl);
-        grpGitea.Controls.Add(lblOwner);
-        grpGitea.Controls.Add(_txtGiteaOwner);
-        grpGitea.Controls.Add(lblSlash);
-        grpGitea.Controls.Add(_txtGiteaRepo);
-        grpGitea.Controls.Add(lblToken);
-        grpGitea.Controls.Add(_txtGiteaToken);
-        grpGitea.Controls.Add(btnCheckUpdate);
-        grpGitea.Controls.Add(_chkAutoCheckUpdates);
-        grpGitea.Controls.Add(_chkAutoInstallUpdates);
+        grpUpdates.Controls.Add(lblSource);
+        grpUpdates.Controls.Add(btnCheckUpdate);
+        grpUpdates.Controls.Add(_chkAutoCheckUpdates);
+        grpUpdates.Controls.Add(_chkAutoInstallUpdates);
 
         var grpLogs = new GroupBox
         {
@@ -329,10 +288,6 @@ public class SettingsForm : Form
                     _chkTwoWayDelete.Checked = _config.TwoWayDelete;
                     _chkStartWithWindows.Checked = _config.StartWithWindows;
                     _chkNotifications.Checked = _config.ShowNotifications;
-                    _txtGiteaUrl.Text = _config.GiteaServerUrl;
-                    _txtGiteaOwner.Text = _config.GiteaRepoOwner;
-                    _txtGiteaRepo.Text = _config.GiteaRepoName;
-                    _txtGiteaToken.Text = _config.GiteaAccessToken;
                     _chkAutoCheckUpdates.Checked = _config.AutoCheckUpdates;
                     _chkAutoInstallUpdates.Checked = _config.AutoInstallUpdates;
                     _syncEngine.UpdateConfiguration();
@@ -432,7 +387,7 @@ public class SettingsForm : Form
 
         Controls.Add(grpFolder);
         Controls.Add(grpSync);
-        Controls.Add(grpGitea);
+        Controls.Add(grpUpdates);
         Controls.Add(grpLogs);
         Controls.Add(btnWizard);
         Controls.Add(btnSyncNow);
@@ -543,7 +498,7 @@ public class SettingsForm : Form
         var res = await _updateService.CheckForUpdatesAsync();
         if (!string.IsNullOrWhiteSpace(res.ErrorMessage))
         {
-            MessageBox.Show(res.ErrorMessage, "Kontrola aktualizací Gitea", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(res.ErrorMessage, "Kontrola aktualizací GitHubu", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -558,7 +513,7 @@ public class SettingsForm : Form
         }
 
         var ask = MessageBox.Show(
-            $"Na vašem Gitea serveru je k dispozici nová verze {res.LatestVersion} (vaše verze: {res.CurrentVersion}).\r\n\r\n" +
+            $"Na GitHubu je k dispozici nová verze {res.LatestVersion} (vaše verze: {res.CurrentVersion}).\r\n\r\n" +
             $"Změny:\r\n{res.ReleaseNotes}\r\n\r\nChcete novou verzi nyní automaticky stáhnout a nainstalovat?",
             "Dostupná aktualizace",
             MessageBoxButtons.YesNo,
@@ -886,10 +841,6 @@ public class SettingsForm : Form
         _config.StartWithWindows = _chkStartWithWindows.Checked;
         _config.ShowNotifications = _chkNotifications.Checked;
 
-        _config.GiteaServerUrl = _txtGiteaUrl.Text.Trim();
-        _config.GiteaRepoOwner = _txtGiteaOwner.Text.Trim();
-        _config.GiteaRepoName = _txtGiteaRepo.Text.Trim();
-        _config.GiteaAccessToken = _txtGiteaToken.Text.Trim();
         _config.AutoCheckUpdates = _chkAutoCheckUpdates.Checked;
         _config.AutoInstallUpdates = _chkAutoInstallUpdates.Checked;
         _config.IsFirstRunCompleted = true;

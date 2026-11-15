@@ -41,13 +41,9 @@ public class AppConfig
     /// </summary>
     public bool VerboseLogging { get; set; } = false;
 
-    // Gitea Auto-Update Configuration
+    // Automatické aktualizace z GitHub Releases
     public bool AutoCheckUpdates { get; set; } = true;
     public bool AutoInstallUpdates { get; set; } = false;
-    public string GiteaServerUrl { get; set; } = "https://git.iaho.eu";
-    public string GiteaRepoOwner { get; set; } = "iaho";
-    public string GiteaRepoName { get; set; } = "gphotos-sync";
-    public string GiteaAccessToken { get; set; } = ""; // volitelné (v klientu pro veřejný repozitář nepoužíváno)
 
     [JsonIgnore]
     public bool HasConfigLoadError { get; set; }
@@ -235,10 +231,6 @@ public class AppConfig
         MaxAutoDeletesPerCycle = other.MaxAutoDeletesPerCycle;
         AutoCheckUpdates = other.AutoCheckUpdates;
         AutoInstallUpdates = other.AutoInstallUpdates;
-        GiteaServerUrl = other.GiteaServerUrl;
-        GiteaRepoOwner = other.GiteaRepoOwner;
-        GiteaRepoName = other.GiteaRepoName;
-        GiteaAccessToken = other.GiteaAccessToken;
     }
 
     private static void ApplyInstallerDefaults(AppConfig cfg)
@@ -290,15 +282,6 @@ public class AppConfig
                     if (modeStr == "last_30_days") cfg.InitialSyncDays = 30;
                     if (modeStr == "last_7_days") cfg.InitialSyncDays = 7;
                 }
-
-                if (root.TryGetProperty("GiteaServerUrl", out var giteaUrl) && !string.IsNullOrWhiteSpace(giteaUrl.GetString()))
-                    cfg.GiteaServerUrl = giteaUrl.GetString()!;
-                if (root.TryGetProperty("GiteaRepoOwner", out var giteaOwner) && !string.IsNullOrWhiteSpace(giteaOwner.GetString()))
-                    cfg.GiteaRepoOwner = giteaOwner.GetString()!;
-                if (root.TryGetProperty("GiteaRepoName", out var giteaRepo) && !string.IsNullOrWhiteSpace(giteaRepo.GetString()))
-                    cfg.GiteaRepoName = giteaRepo.GetString()!;
-                if (root.TryGetProperty("GiteaAccessToken", out var giteaToken) && !string.IsNullOrWhiteSpace(giteaToken.GetString()))
-                    cfg.GiteaAccessToken = giteaToken.GetString()!;
 
                 break;
             }

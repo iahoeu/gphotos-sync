@@ -1,6 +1,9 @@
 # GPhotos Sync (Windows) – Dokumentace a Architektura
 
-Automatická synchronizace fotek a videí z **Google Photos** do složky ve Windows s podporou **obousměrného mazání** (přesunutí/smazání fotky na PC ji přesune do koše i v Google Photos) a automatickými aktualizacemi z Gitea serveru (`https://git.iaho.eu/iaho/gphotos-sync`).
+Automatická synchronizace fotek a videí z **Google Photos** do složky ve Windows s podporou **obousměrného mazání** (přesunutí/smazání fotky na PC ji přesune do koše i v Google Photos) a automatickými aktualizacemi z GitHub Releases (<https://github.com/iahoeu/gphotos-sync>).
+
+## Instalace
+Stáhněte nejnovější instalátor `GPhotosSync_Setup.exe` z <https://github.com/iahoeu/gphotos-sync/releases/latest> a spusťte ho.
 
 ## Hlavní funkce
 1. **Automatický běh na pozadí (System Tray):** Spouští se po startu Windows a tiše kontroluje nové fotky a videa v Google Photos.
@@ -23,22 +26,8 @@ Automatická synchronizace fotek a videí z **Google Photos** do složky ve Wind
    - Stáhnout celou historii
    - Výchozí stav režimu „jen nové“ se zaznamenává postupně přes více cyklů; fotky ze dne instalace a novější se mezitím stahují.
    - **Omezení hloubky:** časová osa se prochází posouváním webu od začátku. U velmi velké knihovny nemusí kontrola dosáhnout nejstarší historie (výchozí stav, „celá historie“, týdenní úplná kontrola). Aplikace to pak hlásí u ikony v liště a v protokolu jako „Neúplná kontrola knihovny“.
-6. **Automatická kontrola a tichá instalace aktualizací z Gitea (`git.iaho.eu`):**
-   - Aplikace má ve výchozím stavu přednastavený server `https://git.iaho.eu` (repozitář `iaho/gphotos-sync`).
-   - Kontroluje nejnovější vydání přes REST API (`/api/v1/repos/iaho/gphotos-sync/releases/latest`) a umí instalátor sama stáhnout a provést tichou aktualizaci (`--silent-update`).
+6. **Automatická kontrola a tichá instalace aktualizací z GitHubu:**
+   - Aplikace kontroluje nejnovější vydání přes `https://api.github.com/repos/iahoeu/gphotos-sync/releases/latest` a umí instalátor sama stáhnout a provést tichou aktualizaci (`--silent-update`).
 
-## Napojení na Gitea a vydávání nových verzí
-- **Web / API repozitáře:** `https://git.iaho.eu/iaho/gphotos-sync`
-- **SSH Git remote:** `git@iaho.eu:iaho/gphotos-sync.git`
-- **Nejnovější instalátor ke stažení:** `https://git.iaho.eu/iaho/gphotos-sync/releases/latest`
-
-### Vydání nové verze jedním příkazem
-Ve složce `C:\Antigravity\photos` spusťte:
-```powershell
-.\publish_to_gitea.ps1 -Version "1.0.1" -ReleaseNotes "Popis změn v nové verzi"
-```
-Skript automaticky:
-1. Aktualizuje verzi `<Version>` v projektech.
-2. Zkompiluje aplikaci a zabalí ji do `GPhotosSync_Setup.exe`.
-3. Provede `git commit`, vytvoří tag `v1.0.1` a odešle vše přes SSH do Gitea.
-4. Vytvoří Release na `https://git.iaho.eu/iaho/gphotos-sync/releases` a nahraje k němu `GPhotosSync_Setup.exe`.
+## Licence
+Projekt je šířen pod licencí MIT, viz [LICENSE](LICENSE).

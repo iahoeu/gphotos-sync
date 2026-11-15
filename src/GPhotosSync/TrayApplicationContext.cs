@@ -138,7 +138,7 @@ public class TrayApplicationContext : ApplicationContext
 
         var settingsItem = new ToolStripMenuItem("⚙️ Nastavení a protokol...", null, (_, _) => ShowSettingsWindow());
 
-        _updateMenuItem = new ToolStripMenuItem("⬆️ Zkontrolovat aktualizace (Gitea)...", null, async (_, _) =>
+        _updateMenuItem = new ToolStripMenuItem("⬆️ Zkontrolovat aktualizace (GitHub)...", null, async (_, _) =>
         {
             await CheckAndPromptUpdateAsync(silentIfUpToDate: false);
         });
@@ -188,11 +188,11 @@ public class TrayApplicationContext : ApplicationContext
             _trayIcon.ShowBalloonTip(5000, title, msg, icon);
         };
 
-        // Check for Gitea updates every 6 hours
+        // Check for GitHub updates every 6 hours
         _updateCheckTimer = new System.Windows.Forms.Timer { Interval = 6 * 60 * 60 * 1000 };
         _updateCheckTimer.Tick += async (_, _) =>
         {
-            if (_config.AutoCheckUpdates && _updateService.IsConfigured)
+            if (_config.AutoCheckUpdates)
             {
                 await CheckAndPromptUpdateAsync(silentIfUpToDate: true);
             }
@@ -280,7 +280,7 @@ public class TrayApplicationContext : ApplicationContext
             }
         }
 
-        if (_config.AutoCheckUpdates && _updateService.IsConfigured)
+        if (_config.AutoCheckUpdates)
         {
             _ = CheckAndPromptUpdateAsync(silentIfUpToDate: true);
         }
@@ -290,21 +290,12 @@ public class TrayApplicationContext : ApplicationContext
 
     private async Task CheckAndPromptUpdateAsync(bool silentIfUpToDate)
     {
-        if (!_updateService.IsConfigured)
-        {
-            if (!silentIfUpToDate)
-            {
-                ShowSettingsWindow();
-            }
-            return;
-        }
-
         var res = await _updateService.CheckForUpdatesAsync();
         if (!string.IsNullOrWhiteSpace(res.ErrorMessage))
         {
             if (!silentIfUpToDate)
             {
-                MessageBox.Show(res.ErrorMessage, "Kontrola aktualizací Gitea", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(res.ErrorMessage, "Kontrola aktualizací GitHubu", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             return;
         }
@@ -323,17 +314,17 @@ public class TrayApplicationContext : ApplicationContext
         }
 
         _updateMenuItem.Text = $"⬆️ Nainstalovat novou verzi {res.LatestVersion}!";
-        Logger.Info($"Na Gitea serveru je dostupná nová verze {res.LatestVersion} (současná: {res.CurrentVersion}).");
+        Logger.Info($"Na GitHubu je dostupná nová verze {res.LatestVersion} (současná: {res.CurrentVersion}).");
 
         if (_config.AutoInstallUpdates && !_syncEngine.IsSyncing)
         {
-            Logger.Info("Automatická tichá aktualizace je povolena -> stahuji a instaluji novou verzi z Gitea...");
+            Logger.Info("Automatická tichá aktualizace je povolena -> stahuji a instaluji novou verzi z GitHubu...");
             await _updateService.DownloadAndApplyUpdateAsync(res.DownloadUrl, ExitApplication);
             return;
         }
 
         var ask = MessageBox.Show(
-            $"Na Gitea serveru byla nalezena nová verze Google Photos Sync ({res.LatestVersion}).\r\n\r\n" +
+            $"Na GitHubu byla nalezena nová verze Google Photos Sync ({res.LatestVersion}).\r\n\r\n" +
             $"Změny:\r\n{res.ReleaseNotes}\r\n\r\nChcete aplikaci nyní automaticky aktualizovat?",
             "Dostupná nová verze",
             MessageBoxButtons.YesNo,

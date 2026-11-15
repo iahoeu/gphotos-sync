@@ -37,39 +37,41 @@ public class UpdateService
         return Assembly.GetExecutingAssembly().GetName().Version ?? new Version(1, 0, 0);
     }
 
-    public bool IsConfigured =>
-        !string.IsNullOrWhiteSpace(_config.GiteaServerUrl) &&
-        !string.IsNullOrWhiteSpace(_config.GiteaRepoOwner) &&
-        !string.IsNullOrWhiteSpace(_config.GiteaRepoName);
+    private const string RepoOwner = "iahoeu";
+    private const string RepoName = "gphotos-sync";
+    private const string LatestReleaseApiUrl = "https://api.github.com/repos/" + RepoOwner + "/" + RepoName + "/releases/latest";
+    private const string ReleaseDownloadPrefix = "https://github.com/" + RepoOwner + "/" + RepoName + "/releases/download/";
+
+    private static readonly string[] AllowedHosts =
+    {
+        "api.github.com",
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com"
+    };
 
     /// <summary>
-    /// Ověří, že URL pro aktualizaci používá výhradně protokol HTTPS a směřuje na nakonfigurovaný Gitea server (P2-13).
+    /// Ověří, že URL pro aktualizaci používá výhradně HTTPS (port 443) a směřuje na doménu GitHubu (P2-13).
     /// </summary>
-    public static bool IsAllowedUpdateUrl(string? candidateUrl, string? configuredGiteaServerUrl)
+    public static bool IsAllowedUpdateUrl(string? candidateUrl)
     {
-        if (string.IsNullOrWhiteSpace(candidateUrl) || string.IsNullOrWhiteSpace(configuredGiteaServerUrl))
+        if (string.IsNullOrWhiteSpace(candidateUrl))
             return false;
 
-        if (!Uri.TryCreate(configuredGiteaServerUrl.Trim(), UriKind.Absolute, out var baseUri) ||
-            !string.Equals(baseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        if (!Uri.TryCreate(candidateUrl.Trim(), UriKind.Absolute, out var uri) ||
+            !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+            uri.Port != 443)
         {
             return false;
         }
 
-        if (!Uri.TryCreate(candidateUrl.Trim(), UriKind.Absolute, out var candidateUri) ||
-            !string.Equals(candidateUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        return string.Equals(candidateUri.Host, baseUri.Host, StringComparison.OrdinalIgnoreCase) &&
-               candidateUri.Port == baseUri.Port;
+        return AllowedHosts.Contains(uri.Host, StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>
-    /// Vybere URL instalátoru z pole assets v Gitea release odpovědi a ověří, že splňuje bezpečnostní pravidla (P2-13).
+    /// Vybere URL instalátoru z pole assets v GitHub release odpovědi a ověří, že splňuje bezpečnostní pravidla (P2-13).
     /// </summary>
-    public static string SelectInstallerAssetUrl(JsonElement assetsArray, string? configuredGiteaServerUrl)
+    public static string SelectInstallerAssetUrl(JsonElement assetsArray)
     {
         if (assetsArray.ValueKind != JsonValueKind.Array)
             return string.Empty;
@@ -84,7 +86,8 @@ public class UpdateService
             if (!name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(url))
                 continue;
 
-            if (!IsAllowedUpdateUrl(url, configuredGiteaServerUrl))
+            if (!IsAllowedUpdateUrl(url) ||
+                !url.Trim().StartsWith(ReleaseDownloadPrefix, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             if (name.Contains("Setup", StringComparison.OrdinalIgnoreCase))
@@ -100,6 +103,7 @@ public class UpdateService
     private async Task<HttpResponseMessage> SendWithSafeRedirectAsync(
         string initialUrl,
         string? userAgentVersion,
+        bool isApiCall,
         HttpCompletionOption completionOption,
         CancellationToken ct)
     {
@@ -108,16 +112,25 @@ public class UpdateService
 
         for (int i = 0; i <= maxRedirects; i++)
         {
-            if (!IsAllowedUpdateUrl(currentUrl, _config.GiteaServerUrl))
+            if (!IsAllowedUpdateUrl(currentUrl))
             {
                 throw new InvalidOperationException(
-                    $"Nepovolená URL pro aktualizaci: '{currentUrl}'. Povoleno je pouze HTTPS na nakonfigurovaném Gitea serveru.");
+                    $"Nepovolená URL pro aktualizaci: '{currentUrl}'. Povoleno je pouze HTTPS na doménách GitHubu.");
             }
 
             using var req = new HttpRequestMessage(HttpMethod.Get, currentUrl);
             if (!string.IsNullOrWhiteSpace(userAgentVersion))
             {
                 req.Headers.UserAgent.Add(new ProductInfoHeaderValue("GPhotosSync", userAgentVersion));
+            }
+            if (isApiCall)
+            {
+                req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+                req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
+            }
+            else
+            {
+                req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
             }
 
             var resp = await Http.SendAsync(req, completionOption, ct);
@@ -135,7 +148,7 @@ public class UpdateService
             return resp;
         }
 
-        throw new InvalidOperationException("Příliš mnoho přesměrování při komunikaci s Gitea serverem.");
+        throw new InvalidOperationException("Příliš mnoho přesměrování při komunikaci s GitHubem.");
     }
 
     public async Task<UpdateCheckResult> CheckForUpdatesAsync(CancellationToken ct = default)
@@ -143,42 +156,20 @@ public class UpdateService
         var currentVer = GetCurrentVersion();
         var currentVerStr = $"{currentVer.Major}.{currentVer.Minor}.{Math.Max(0, currentVer.Build)}";
 
-        if (!IsConfigured)
-        {
-            return new UpdateCheckResult
-            {
-                IsUpdateAvailable = false,
-                CurrentVersion = currentVerStr,
-                ErrorMessage = "Gitea server pro aktualizace zatím není vyplněn v Nastavení."
-            };
-        }
-
         try
         {
-            var baseUrl = _config.GiteaServerUrl.Trim().TrimEnd('/');
-            if (!IsAllowedUpdateUrl(baseUrl, _config.GiteaServerUrl))
-            {
-                return new UpdateCheckResult
-                {
-                    IsUpdateAvailable = false,
-                    CurrentVersion = currentVerStr,
-                    ErrorMessage = "URL Gitea serveru musí začínat na https://."
-                };
-            }
-
-            var owner = _config.GiteaRepoOwner.Trim();
-            var repo = _config.GiteaRepoName.Trim();
-
-            var apiUrl = $"{baseUrl}/api/v1/repos/{owner}/{repo}/releases/latest";
-
-            using var resp = await SendWithSafeRedirectAsync(apiUrl, currentVerStr, HttpCompletionOption.ResponseContentRead, ct);
+            using var resp = await SendWithSafeRedirectAsync(LatestReleaseApiUrl, currentVerStr, true, HttpCompletionOption.ResponseContentRead, ct);
             if (!resp.IsSuccessStatusCode)
             {
+                var status = (int)resp.StatusCode;
+                var hint = status is 403 or 429
+                    ? " Limit požadavků GitHubu byl pravděpodobně překročen, kontrola se zopakuje později."
+                    : "";
                 return new UpdateCheckResult
                 {
                     IsUpdateAvailable = false,
                     CurrentVersion = currentVerStr,
-                    ErrorMessage = $"Gitea API vrátilo stav {(int)resp.StatusCode} ({resp.ReasonPhrase})."
+                    ErrorMessage = $"GitHub API vrátilo stav {status} ({resp.ReasonPhrase}).{hint}"
                 };
             }
 
@@ -203,7 +194,7 @@ public class UpdateService
             string downloadUrl = "";
             if (root.TryGetProperty("assets", out var assetsProp) && assetsProp.ValueKind == JsonValueKind.Array)
             {
-                downloadUrl = SelectInstallerAssetUrl(assetsProp, _config.GiteaServerUrl);
+                downloadUrl = SelectInstallerAssetUrl(assetsProp);
             }
 
             bool isNewer = latestVer > new Version(currentVer.Major, currentVer.Minor, Math.Max(0, currentVer.Build));
@@ -215,7 +206,7 @@ public class UpdateService
                     IsUpdateAvailable = false,
                     CurrentVersion = currentVerStr,
                     LatestVersion = $"{latestVer.Major}.{latestVer.Minor}.{Math.Max(0, latestVer.Build)}",
-                    ErrorMessage = "Byla nalezena nová verze, ale neobsahuje platný instalátor na povolené HTTPS doméně Gitea serveru."
+                    ErrorMessage = "Byla nalezena nová verze, ale neobsahuje platný instalátor na povolené HTTPS doméně GitHubu."
                 };
             }
 
@@ -230,7 +221,7 @@ public class UpdateService
         }
         catch (Exception ex)
         {
-            Logger.Warn($"Kontrola aktualizací na Gitea serveru selhala: {ex.Message}");
+            Logger.Warn($"Kontrola aktualizací na GitHubu selhala: {ex.Message}");
             return new UpdateCheckResult
             {
                 IsUpdateAvailable = false,
@@ -244,18 +235,18 @@ public class UpdateService
     {
         try
         {
-            if (!IsAllowedUpdateUrl(downloadUrl, _config.GiteaServerUrl))
+            if (!IsAllowedUpdateUrl(downloadUrl))
             {
-                Logger.Error($"Aktualizace zablokována: URL '{downloadUrl}' není na povoleném HTTPS Gitea serveru.");
+                Logger.Error($"Aktualizace zablokována: URL '{downloadUrl}' není na povolené HTTPS doméně GitHubu.");
                 return false;
             }
 
-            Logger.Info($"Stahuji novou verzi instalátoru z Gitea: {downloadUrl}");
+            Logger.Info($"Stahuji novou verzi instalátoru z GitHubu: {downloadUrl}");
 
             var currentVer = GetCurrentVersion();
             var currentVerStr = $"{currentVer.Major}.{currentVer.Minor}.{Math.Max(0, currentVer.Build)}";
 
-            using var resp = await SendWithSafeRedirectAsync(downloadUrl, currentVerStr, HttpCompletionOption.ResponseHeadersRead, ct);
+            using var resp = await SendWithSafeRedirectAsync(downloadUrl, currentVerStr, false, HttpCompletionOption.ResponseHeadersRead, ct);
             resp.EnsureSuccessStatusCode();
 
             var tempUpdateExe = Path.Combine(Path.GetTempPath(), $"GPhotosSync_Update_{Guid.NewGuid():N}.exe");

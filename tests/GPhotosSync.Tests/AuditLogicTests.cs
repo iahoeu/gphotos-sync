@@ -65,22 +65,28 @@ public class AuditLogicTests : IDisposable
     }
 
     // -------------------------------------------------------------------------
-    // P2-13: Ověření aktualizační URL a výběru assetu (pouze HTTPS a povolený Gitea server)
+    // P2-13: Ověření aktualizační URL a výběru assetu (pouze HTTPS a povolené domény GitHubu)
     // -------------------------------------------------------------------------
 
     [Theory]
-    [InlineData("https://git.iaho.eu/iaho/gphotos-sync/releases/download/v1.0.3/GPhotosSync_Setup.exe", "https://git.iaho.eu", true)]
-    [InlineData("http://git.iaho.eu/iaho/gphotos-sync/releases/download/v1.0.3/GPhotosSync_Setup.exe", "https://git.iaho.eu", false)]
-    [InlineData("https://evil.example.com/GPhotosSync_Setup.exe", "https://git.iaho.eu", false)]
-    [InlineData("https://git.iaho.eu:8443/GPhotosSync_Setup.exe", "https://git.iaho.eu", false)]
-    [InlineData("https://git.iaho.eu/GPhotosSync_Setup.exe", "http://git.iaho.eu", false)]
-    public void IsAllowedUpdateUrl_EnforcesHttpsAndSameHostPort(string candidateUrl, string serverUrl, bool expected)
+    [InlineData("https://github.com/iahoeu/gphotos-sync/releases/download/v1.0.3/GPhotosSync_Setup.exe", true)]
+    [InlineData("https://api.github.com/repos/iahoeu/gphotos-sync/releases/latest", true)]
+    [InlineData("https://objects.githubusercontent.com/github-production-release-asset/GPhotosSync_Setup.exe", true)]
+    [InlineData("https://release-assets.githubusercontent.com/github-production-release-asset/GPhotosSync_Setup.exe", true)]
+    [InlineData("https://GitHub.com/iahoeu/gphotos-sync/releases/download/v1.0.3/GPhotosSync_Setup.exe", true)]
+    [InlineData("http://github.com/iahoeu/gphotos-sync/releases/download/v1.0.3/GPhotosSync_Setup.exe", false)]
+    [InlineData("https://evil.example.com/GPhotosSync_Setup.exe", false)]
+    [InlineData("https://github.com.evil.example.com/GPhotosSync_Setup.exe", false)]
+    [InlineData("https://github.com:8443/iahoeu/gphotos-sync/releases/download/v1.0.3/GPhotosSync_Setup.exe", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void IsAllowedUpdateUrl_EnforcesHttpsAndGitHubHosts(string? candidateUrl, bool expected)
     {
-        Assert.Equal(expected, UpdateService.IsAllowedUpdateUrl(candidateUrl, serverUrl));
+        Assert.Equal(expected, UpdateService.IsAllowedUpdateUrl(candidateUrl));
     }
 
     [Fact]
-    public void SelectInstallerAssetUrl_PicksSetupExeOnAllowedHost_RejectsExternalOrHttp()
+    public void SelectInstallerAssetUrl_PicksSetupExeOfThisRepo_RejectsOtherRepoAndExternalHost()
     {
         var json = """
         [
@@ -89,20 +95,38 @@ public class AuditLogicTests : IDisposable
             "browser_download_url": "https://evil.example.com/GPhotosSync_Setup.exe"
           },
           {
+            "name": "GPhotosSync_Setup.exe",
+            "browser_download_url": "https://github.com/other/repo/releases/download/v1.1.0/GPhotosSync_Setup.exe"
+          },
+          {
             "name": "other_tool.exe",
-            "browser_download_url": "https://git.iaho.eu/iaho/gphotos-sync/releases/download/v1.1.0/other_tool.exe"
+            "browser_download_url": "https://github.com/iahoeu/gphotos-sync/releases/download/v1.1.0/other_tool.exe"
           },
           {
             "name": "GPhotosSync_Setup.exe",
-            "browser_download_url": "https://git.iaho.eu/iaho/gphotos-sync/releases/download/v1.1.0/GPhotosSync_Setup.exe"
+            "browser_download_url": "https://github.com/iahoeu/gphotos-sync/releases/download/v1.1.0/GPhotosSync_Setup.exe"
           }
         ]
         """;
 
         using var doc = JsonDocument.Parse(json);
-        var selected = UpdateService.SelectInstallerAssetUrl(doc.RootElement, "https://git.iaho.eu");
+        var selected = UpdateService.SelectInstallerAssetUrl(doc.RootElement);
 
-        Assert.Equal("https://git.iaho.eu/iaho/gphotos-sync/releases/download/v1.1.0/GPhotosSync_Setup.exe", selected);
+        Assert.Equal("https://github.com/iahoeu/gphotos-sync/releases/download/v1.1.0/GPhotosSync_Setup.exe", selected);
+    }
+
+    [Fact]
+    public void SelectInstallerAssetUrl_OnlyForeignAssets_ReturnsEmpty()
+    {
+        var json = """
+        [
+          { "name": "GPhotosSync_Setup.exe", "browser_download_url": "https://github.com/other/repo/releases/download/v1.1.0/GPhotosSync_Setup.exe" },
+          { "name": "GPhotosSync_Setup.exe", "browser_download_url": "https://evil.example.com/GPhotosSync_Setup.exe" }
+        ]
+        """;
+
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(string.Empty, UpdateService.SelectInstallerAssetUrl(doc.RootElement));
     }
 
     // -------------------------------------------------------------------------
