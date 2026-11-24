@@ -89,6 +89,7 @@ public class GoogleLoginForm : Form
         {
             var env = await _photosEngine.GetSharedEnvironmentAsync();
             await _webView.EnsureCoreWebView2Async(env);
+            await GooglePhotosEngine.HideWebView2BrandAsync(_webView.CoreWebView2);
             var loginUrl = "https://accounts.google.com/ServiceLogin?service=lh2&continue=https://photos.google.com/";
             if (_loginHintEmail != null)
             {

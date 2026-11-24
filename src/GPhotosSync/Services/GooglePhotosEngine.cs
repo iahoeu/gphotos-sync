@@ -371,6 +371,7 @@ public class GooglePhotosEngine : IDisposable
         _webView.CoreWebView2!.Settings.IsStatusBarEnabled = false;
         _webView.CoreWebView2.Settings.AreDefaultScriptDialogsEnabled = false;
         _webView.CoreWebView2.IsMuted = true;
+        await HideWebView2BrandAsync(_webView.CoreWebView2);
 
         // Force document.visibilityState to always report 'visible' so Google Photos lazy loader stays active
         await _webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(@"
@@ -384,6 +385,54 @@ public class GooglePhotosEngine : IDisposable
 
         _isInitialized = true;
     }
+
+    private const string WebView2Brand = "Microsoft Edge WebView2";
+    private static readonly Regex WebView2BrandRegex = new(@",\s*""Microsoft Edge WebView2"";v=""[^""]*""", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Pokus: Google podle všeho ukončuje přihlášení ve WebView2 zhruba po 7 dnech. WebView2 se od běžného Edge
+    /// liší jen značkou "Microsoft Edge WebView2" v Client Hints (hlavičky Sec-CH-UA*, navigator.userAgentData);
+    /// User-Agent je shodný s Edge. Značku proto odstraníme, aby se prohlížeč hlásil jako obyčejný Edge.
+    /// </summary>
+    public static async Task HideWebView2BrandAsync(CoreWebView2 core)
+    {
+        core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All, CoreWebView2WebResourceRequestSourceKinds.All);
+        core.WebResourceRequested += (_, e) =>
+        {
+            var headers = e.Request.Headers;
+            foreach (var name in new[] { "Sec-CH-UA", "Sec-CH-UA-Full-Version-List" })
+            {
+                if (headers.Contains(name))
+                {
+                    var value = headers.GetHeader(name);
+                    var stripped = StripWebView2Brand(value);
+                    if (stripped != value) headers.SetHeader(name, stripped);
+                }
+            }
+        };
+
+        await core.AddScriptToExecuteOnDocumentCreatedAsync($@"
+            try {{
+                const uad = navigator.userAgentData;
+                if (uad) {{
+                    const strip = list => list.filter(b => b.brand !== '{WebView2Brand}');
+                    const proto = Object.getPrototypeOf(uad);
+                    const brands = strip(uad.brands);
+                    Object.defineProperty(proto, 'brands', {{ get: () => brands, configurable: true }});
+                    const getHighEntropyValues = proto.getHighEntropyValues;
+                    proto.getHighEntropyValues = function (hints) {{
+                        return getHighEntropyValues.call(this, hints).then(r => {{
+                            if (r.brands) r.brands = strip(r.brands);
+                            if (r.fullVersionList) r.fullVersionList = strip(r.fullVersionList);
+                            return r;
+                        }});
+                    }};
+                }}
+            }} catch (e) {{}}
+        ");
+    }
+
+    public static string StripWebView2Brand(string headerValue) => WebView2BrandRegex.Replace(headerValue, "");
 
     public async Task<CoreWebView2Environment> GetSharedEnvironmentAsync()
     {

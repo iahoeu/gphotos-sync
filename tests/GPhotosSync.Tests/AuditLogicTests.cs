@@ -1307,4 +1307,17 @@ public class AuditLogicTests : IDisposable
     {
         Assert.Equal(expected, GooglePhotosEngine.StripUrlQuery(url));
     }
+
+    [Theory]
+    [InlineData(
+        "\"Microsoft Edge\";v=\"158\", \"Chromium\";v=\"158\", \"Not.A/Brand\";v=\"24\", \"Microsoft Edge WebView2\";v=\"158\"",
+        "\"Microsoft Edge\";v=\"158\", \"Chromium\";v=\"158\", \"Not.A/Brand\";v=\"24\"")]
+    [InlineData(
+        "\"Microsoft Edge\";v=\"158.0.4370.33\", \"Microsoft Edge WebView2\";v=\"158.0.4370.33\", \"Chromium\";v=\"158.0.8127.37\"",
+        "\"Microsoft Edge\";v=\"158.0.4370.33\", \"Chromium\";v=\"158.0.8127.37\"")]
+    [InlineData("\"Microsoft Edge\";v=\"158\", \"Chromium\";v=\"158\"", "\"Microsoft Edge\";v=\"158\", \"Chromium\";v=\"158\"")]
+    public void StripWebView2Brand_RemovesOnlyWebView2Brand(string header, string expected)
+    {
+        Assert.Equal(expected, GooglePhotosEngine.StripWebView2Brand(header));
+    }
 }
