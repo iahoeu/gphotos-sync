@@ -12,11 +12,14 @@ public class GoogleLoginForm : Form
     private readonly Button _btnDone;
     private readonly System.Windows.Forms.Timer _checkTimer;
 
+    private readonly string? _loginHintEmail;
+
     public bool LoginSucceeded { get; private set; }
 
-    public GoogleLoginForm(GooglePhotosEngine photosEngine)
+    public GoogleLoginForm(GooglePhotosEngine photosEngine, string? loginHintEmail = null)
     {
         _photosEngine = photosEngine;
+        _loginHintEmail = string.IsNullOrWhiteSpace(loginHintEmail) ? null : loginHintEmail.Trim();
         // Přihlašovací okno může přepnout účet -> dřívější ruční potvrzení e-mailu už neplatí
         _photosEngine.ClearConfirmedSessionAccountEmail();
 
@@ -86,7 +89,13 @@ public class GoogleLoginForm : Form
         {
             var env = await _photosEngine.GetSharedEnvironmentAsync();
             await _webView.EnsureCoreWebView2Async(env);
-            _webView.CoreWebView2.Navigate("https://accounts.google.com/ServiceLogin?service=lh2&continue=https://photos.google.com/");
+            var loginUrl = "https://accounts.google.com/ServiceLogin?service=lh2&continue=https://photos.google.com/";
+            if (_loginHintEmail != null)
+            {
+                // Předvyplnit známý účet, aby při opětovném přihlášení stačilo zadat heslo
+                loginUrl += "&Email=" + Uri.EscapeDataString(_loginHintEmail);
+            }
+            _webView.CoreWebView2.Navigate(loginUrl);
             _checkTimer.Start();
         }
         catch (Exception ex)

@@ -15,6 +15,7 @@ public class TrayApplicationContext : ApplicationContext
 
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _statusMenuItem;
+    private readonly ToolStripMenuItem _reloginMenuItem;
     private readonly ToolStripMenuItem _unverifiedAccountMenuItem;
     private readonly ToolStripMenuItem _approveBulkDeleteMenuItem;
     private readonly ToolStripMenuItem _cancelBulkDeleteMenuItem;
@@ -28,6 +29,12 @@ public class TrayApplicationContext : ApplicationContext
     private readonly Icon _iconError;     // červená: chyba
 
     private SettingsForm? _openSettingsForm;
+
+    // Google ruší relaci zhruba po 7 dnech a bez hesla ji obnovit nejde -> připomínat, dokud se uživatel znovu nepřihlásí
+    private static readonly TimeSpan LoginReminderInterval = TimeSpan.FromHours(6);
+    private bool _requiresLogin;
+    private bool _isLoginWindowOpen;
+    private DateTime _lastLoginReminderUtc = DateTime.MinValue;
 
     public TrayApplicationContext()
     {
@@ -106,34 +113,19 @@ public class TrayApplicationContext : ApplicationContext
             Logger.Info($"Obousměrné mazání bylo {(_config.TwoWayDelete ? "ZAPNUTO" : "VYPNUTO")}.");
         };
 
+        _reloginMenuItem = new ToolStripMenuItem("🔑 Přihlásit se znovu ke Google Photos...", null, async (_, _) =>
+        {
+            await OpenLoginWindowAsync(keepExpectedAccount: true);
+        })
+        {
+            Visible = false,
+            Font = new Font(SystemFonts.MenuFont ?? Control.DefaultFont, FontStyle.Bold),
+            ForeColor = Color.FromArgb(190, 40, 40)
+        };
+
         var loginItem = new ToolStripMenuItem("🔑 Účet Google Photos (Přihlášení)...", null, async (_, _) =>
         {
-            // Přihlašovací okno sdílí profil prohlížeče se synchronizací -> nejdřív ji zastavit
-            await _syncEngine.StopAndWaitForIdleAsync();
-            try
-            {
-            using var loginForm = new GoogleLoginForm(_photosEngine);
-            loginForm.ShowDialog();
-            if (loginForm.LoginSucceeded)
-            {
-                _config.ExpectedGoogleAccountEmail = string.Empty;
-                var check = await _photosEngine.CheckLoginAndAccountAsync();
-                if (!string.IsNullOrWhiteSpace(check.DetectedEmail))
-                {
-                    _syncEngine.ConfirmGoogleAccountEmailManually(check.DetectedEmail);
-                }
-                else
-                {
-                    SettingsForm.PromptManualGoogleAccountConfirmation(null, _config, _syncEngine, _photosEngine);
-                }
-            }
-            }
-            finally
-            {
-                _syncEngine.UpdateConfiguration();
-            }
-            _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
-            await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
+            await OpenLoginWindowAsync(keepExpectedAccount: false);
         });
 
         var settingsItem = new ToolStripMenuItem("⚙️ Nastavení a protokol...", null, (_, _) => ShowSettingsWindow());
@@ -147,6 +139,7 @@ public class TrayApplicationContext : ApplicationContext
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusMenuItem);
+        menu.Items.Add(_reloginMenuItem);
         menu.Items.Add(_unverifiedAccountMenuItem);
         menu.Items.Add(_approveBulkDeleteMenuItem);
         menu.Items.Add(_cancelBulkDeleteMenuItem);
@@ -170,9 +163,13 @@ public class TrayApplicationContext : ApplicationContext
         };
 
         _trayIcon.DoubleClick += (_, _) => OpenDownloadFolder();
-        _trayIcon.BalloonTipClicked += (_, _) =>
+        _trayIcon.BalloonTipClicked += async (_, _) =>
         {
-            if (_syncEngine.PendingBulkDeleteCount > 0 || _syncEngine.IsDeletePausedDueToUnverifiedAccount)
+            if (_requiresLogin)
+            {
+                await OpenLoginWindowAsync(keepExpectedAccount: true);
+            }
+            else if (_syncEngine.PendingBulkDeleteCount > 0 || _syncEngine.IsDeletePausedDueToUnverifiedAccount)
             {
                 _trayIcon.ContextMenuStrip?.Show(Cursor.Position);
             }
@@ -353,6 +350,7 @@ public class TrayApplicationContext : ApplicationContext
         _trayIcon.Text = shortTooltip;
 
         _unverifiedAccountMenuItem.Visible = e.IsDeletePausedDueToUnverifiedAccount;
+        UpdateLoginReminder(e);
 
         bool hasPendingBulkDelete = e.PendingBulkDeleteCount > 0;
         _approveBulkDeleteMenuItem.Visible = hasPendingBulkDelete;
@@ -375,6 +373,73 @@ public class TrayApplicationContext : ApplicationContext
         {
             _trayIcon.Icon = _iconOk;
         }
+    }
+
+    private void UpdateLoginReminder(SyncStatusEventArgs e)
+    {
+        // Průběžné stavy cyklu ("Kontroluji přihlášení...") stav přihlášení nemění
+        if (e.IsSyncing) return;
+
+        _requiresLogin = e.RequiresLogin;
+        _reloginMenuItem.Visible = _requiresLogin;
+        if (!_requiresLogin)
+        {
+            _lastLoginReminderUtc = DateTime.MinValue;
+            return;
+        }
+
+        if (_isLoginWindowOpen || DateTime.UtcNow - _lastLoginReminderUtc < LoginReminderInterval) return;
+        _lastLoginReminderUtc = DateTime.UtcNow;
+
+        var account = string.IsNullOrWhiteSpace(_config.ExpectedGoogleAccountEmail)
+            ? "svému účtu Google"
+            : $"účtu {_config.ExpectedGoogleAccountEmail}";
+        _trayIcon.ShowBalloonTip(
+            30000,
+            "Fotky se nestahují – přihlaste se znovu",
+            $"Google vás z bezpečnostních důvodů odhlásil. Klikněte sem a zadejte heslo k {account}.",
+            ToolTipIcon.Warning);
+    }
+
+    private async Task OpenLoginWindowAsync(bool keepExpectedAccount)
+    {
+        if (_isLoginWindowOpen) return;
+        _isLoginWindowOpen = true;
+        try
+        {
+            // Přihlašovací okno sdílí profil prohlížeče se synchronizací -> nejdřív ji zastavit
+            await _syncEngine.StopAndWaitForIdleAsync();
+            try
+            {
+                var expectedEmail = keepExpectedAccount ? _config.ExpectedGoogleAccountEmail : null;
+                using var loginForm = new GoogleLoginForm(_photosEngine, expectedEmail);
+                loginForm.ShowDialog();
+                if (loginForm.LoginSucceeded)
+                {
+                    // Při opětovném přihlášení ponechat uložený účet -> přihlášení k jinému účtu odhalí kontrola shody
+                    if (!keepExpectedAccount) _config.ExpectedGoogleAccountEmail = string.Empty;
+                    var check = await _photosEngine.CheckLoginAndAccountAsync(expectedEmail);
+                    if (!string.IsNullOrWhiteSpace(check.DetectedEmail))
+                    {
+                        if (check.IsLoggedIn) _syncEngine.ConfirmGoogleAccountEmailManually(check.DetectedEmail);
+                    }
+                    else if (check.IsLoggedIn)
+                    {
+                        SettingsForm.PromptManualGoogleAccountConfirmation(null, _config, _syncEngine, _photosEngine);
+                    }
+                }
+            }
+            finally
+            {
+                _syncEngine.UpdateConfiguration();
+            }
+            _unverifiedAccountMenuItem.Visible = _syncEngine.IsDeletePausedDueToUnverifiedAccount;
+        }
+        finally
+        {
+            _isLoginWindowOpen = false;
+        }
+        await _syncEngine.RunSyncCycleAsync(manualTrigger: true);
     }
 
     private void OpenDownloadFolder()
