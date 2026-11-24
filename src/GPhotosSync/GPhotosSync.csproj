@@ -12,7 +12,7 @@
     <AssemblyName>GPhotosSync</AssemblyName>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <RootNamespace>GPhotosSync</RootNamespace>
-    <Version>1.0.16</Version>
+    <Version>1.0.17</Version>
     <Product>Google Photos Sync pro Windows</Product>
     <Company>GPhotosSync</Company>
     <Description>AutomatickĂˇ obousmÄ›rnĂˇ synchronizace fotek a videĂ­ z Google Photos do sloĹľky ve Windows</Description>
